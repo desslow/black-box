@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ozon BlackBox (Forensics & Audit Core)
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      2.0
 // @description  Ozon BlackBox
 // @author       desslow
 // @match        https://*.ozon.ru/*
@@ -12,15 +12,22 @@
 (function() {
     'use strict';
 
-    const DB_NAME = 'OzonBlackBoxDB';
-    const DB_VERSION = 2;
-    let db = null;
+    const DB_NAME = '_o3_telemetry_cache';
+    const DB_VERSION = 1;
+    const TTL_DAYS = 180;
+    const ENABLE_DEV_PURGE = true;
 
+    let db = null;
     let scanBuffer = '';
     let lastScanTime = Date.now();
     let currentOperator = '';
+    let activeSession = null;
+    let currentPostingsList = [];
+    let externalDumpData = null;
+    window._ozonAuthHeaders = null;
 
     const TAB_ID = Math.random().toString(36).slice(2, 9);
+    const MONTHS_RU = ['янв.', 'фев.', 'мар.', 'апр.', 'мая', 'июн.', 'июл.', 'авг.', 'сен.', 'окт.', 'нояб.', 'дек.'];
 
     const RUS_TO_ENG = {
         'й':'q','ц':'w','у':'e','к':'r','е':'t','н':'y','г':'u','ш':'i','щ':'o','з':'p',
@@ -30,10 +37,7 @@
     };
 
     function translit(str) {
-        return str.split('').map(ch => {
-            const low = ch.toLowerCase();
-            return RUS_TO_ENG[low] || ch;
-        }).join('');
+        return str.split('').map(ch => RUS_TO_ENG[ch.toLowerCase()] || ch).join('');
     }
 
     function initDB() {
@@ -57,10 +61,41 @@
                 if (navigator.storage && navigator.storage.persist) {
                     navigator.storage.persist();
                 }
+                purgeExpiredData();
                 resolve(db);
             };
             req.onerror = () => reject(req.error);
         });
+    }
+
+    function purgeExpiredData() {
+        if (!db) return;
+        const expireTs = Date.now() - (TTL_DAYS * 24 * 3600 * 1000);
+        try {
+            const tx = db.transaction(['sessions', 'scans_history'], 'readwrite');
+            const sStore = tx.objectStore('sessions');
+            const scStore = tx.objectStore('scans_history');
+
+            const sIndex = sStore.index('by_closedAt');
+            const sRange = IDBKeyRange.upperBound(expireTs);
+            sIndex.openCursor(sRange).onsuccess = (e) => {
+                const cursor = e.target.result;
+                if (cursor) {
+                    sStore.delete(cursor.primaryKey);
+                    cursor.continue();
+                }
+            };
+
+            const scIndex = scStore.index('by_time');
+            const scRange = IDBKeyRange.upperBound(expireTs);
+            scIndex.openCursor(scRange).onsuccess = (e) => {
+                const cursor = e.target.result;
+                if (cursor) {
+                    scStore.delete(cursor.primaryKey);
+                    cursor.continue();
+                }
+            };
+        } catch (e) {}
     }
 
     function dbPut(storeName, data) {
@@ -108,6 +143,21 @@
         });
     }
 
+    function clearEntireDB() {
+        if (!db) return Promise.resolve();
+        return new Promise((resolve) => {
+            try {
+                const tx = db.transaction(['sessions', 'scans_history'], 'readwrite');
+                tx.objectStore('sessions').clear();
+                tx.objectStore('scans_history').clear();
+                tx.oncomplete = () => resolve(true);
+                tx.onerror = () => resolve(false);
+            } catch (e) {
+                resolve(false);
+            }
+        });
+    }
+
     function getOperatorLogin() {
         const el = document.querySelector('[class*="_rightAvatarMenuLogin_"]');
         if (el) currentOperator = el.textContent.trim().replace('PVZ_', '');
@@ -145,16 +195,17 @@
         const sId = String(sessionId);
 
         const readyPostings = (data.postings || []).filter(p => p.pvzState === 'ReadyToGiveout' || !p.pvzState);
+        currentPostingsList = readyPostings;
 
-        const clientId = data.client?.ozonClientId || (data.client?.clientId) || '';
+        const clientId = data.client?.ozonClientId || data.client?.clientId || '';
         const clientName = data.client?.clientShortName || '';
         const shelves = Array.isArray(data.postingsShelves) ? data.postingsShelves.join(', ') : '';
         const currentCode = sessionStorage.getItem('client_code_' + sId) || (clientId ? `${clientId}*----` : '');
 
-        let existing = await dbGet('sessions', sId);
+        let session = await dbGet('sessions', sId);
 
-        if (!existing) {
-            existing = {
+        if (!session) {
+            session = {
                 sessionId: sId,
                 clientId: String(clientId),
                 clientName: clientName,
@@ -164,6 +215,7 @@
                 durationSec: 0,
                 operator: getOperatorLogin(),
                 shelves: shelves,
+                closeReason: 'active',
                 postings: readyPostings.map(extractPostingDetails),
                 timeline: [
                     { time: Date.now(), type: 'start', text: 'Сессия открыта' }
@@ -172,19 +224,22 @@
                 tabId: TAB_ID
             };
         } else {
-            if (clientId) existing.clientId = String(clientId);
-            if (clientName) existing.clientName = clientName;
-            if (shelves) existing.shelves = shelves;
-            if (currentCode) existing.pickupCode = currentCode;
-            existing.postings = readyPostings.map(extractPostingDetails);
+            if (clientId) session.clientId = String(clientId);
+            if (clientName) session.clientName = clientName;
+            if (shelves) session.shelves = shelves;
+            if (currentCode) session.pickupCode = currentCode;
+            session.postings = readyPostings.map(extractPostingDetails);
         }
 
-        await dbPut('sessions', existing);
+        activeSession = session;
+        await dbPut('sessions', session);
     }
 
     async function recordTimelineEvent(sId, type, text, isAlien = false, extraData = {}) {
-        if (!sId) return;
-        const session = await dbGet('sessions', String(sId));
+        const targetId = sId ? String(sId) : (activeSession ? activeSession.sessionId : null);
+        if (!targetId) return;
+
+        const session = await dbGet('sessions', targetId);
         if (!session) return;
 
         const ev = { time: Date.now(), type, text, isAlien, ...extraData };
@@ -192,11 +247,12 @@
         if (isAlien) {
             session.alienScans.push(ev);
         }
+        activeSession = session;
         await dbPut('sessions', session);
     }
 
-    async function finalizeActiveSession(sId) {
-        const targetId = sId ? String(sId) : getActiveSessionIdOnTab();
+    async function finalizeActiveSession(sId, reason = 'completed') {
+        const targetId = sId ? String(sId) : (activeSession ? activeSession.sessionId : getActiveSessionIdOnTab());
         if (!targetId) return;
 
         const session = await dbGet('sessions', targetId);
@@ -205,6 +261,11 @@
         session.closedAt = Date.now();
         session.durationSec = Math.max(1, Math.round((session.closedAt - session.foundAt) / 1000));
         session.operator = getOperatorLogin() || session.operator;
+        session.closeReason = reason;
+
+        let issuedCount = 0;
+        let annulatedCount = 0;
+        let storageCount = 0;
 
         session.postings.forEach(pObj => {
             const cardWrapper = document.querySelector(`[data-testid="${pObj.id}"]`);
@@ -212,26 +273,45 @@
                 const txt = cardWrapper.textContent;
                 if (txt.includes('К выдаче') && !txt.includes('К аннуляции') && !txt.includes('Отказ')) {
                     pObj.status = 'issued';
+                    issuedCount++;
                 } else if (txt.includes('К аннуляции') || txt.includes('Отказ')) {
                     pObj.status = 'annulated';
                     const reasonBtn = Array.from(cardWrapper.querySelectorAll('button')).find(b => b.textContent.includes('К аннуляции'));
                     pObj.reasonText = reasonBtn ? reasonBtn.textContent.replace('К аннуляции:', '').trim() : 'Отказ';
+                    annulatedCount++;
                 } else {
                     pObj.status = 'storage';
+                    storageCount++;
                 }
+            } else {
+                storageCount++;
             }
         });
 
-        session.timeline.push({ time: Date.now(), type: 'finish', text: 'Сессия завершена' });
+        let summaryText = 'Сессия завершена';
+        if (reason === 'manual_dock') summaryText = 'Закрыто вручную через Dock';
+        else if (reason === 'manual_back') summaryText = 'Выход назад на /orders';
+        else if (reason === 'tab_unloaded') summaryText = 'Вкладка закрыта/обновлена';
+        else if (reason === 'payment_failed') summaryText = 'Сбой оплаты заказа';
+
+        summaryText += ` (Выдано: ${issuedCount}, Отказ: ${annulatedCount}, Хранение: ${storageCount})`;
+
+        session.timeline.push({ time: Date.now(), type: 'finish', text: summaryText });
 
         await dbPut('sessions', session);
+        if (activeSession && String(activeSession.sessionId) === String(targetId)) {
+            activeSession = null;
+        }
     }
 
     async function verifyOzonArticle(barcode) {
         try {
+            const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json, text/plain, */*' };
+            if (window._ozonAuthHeaders) Object.assign(headers, window._ozonAuthHeaders);
+
             const res = await fetch('https://turbo-pvz.ozon.ru/p-api/article-tracking/Entity/Find', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/plain, */*' },
+                headers: headers,
                 body: JSON.stringify({ isManualInput: false, name: barcode }),
                 credentials: 'same-origin'
             });
@@ -245,7 +325,22 @@
         return { isOzonArticle: false };
     }
 
-    function interceptPayload(url, data) {
+    function captureAuthToken(headersObj) {
+        if (!headersObj) return;
+        try {
+            const auth = headersObj.get ? headersObj.get('authorization') : headersObj['authorization'] || headersObj['Authorization'];
+            if (auth) {
+                window._ozonAuthHeaders = {
+                    'authorization': auth,
+                    'x-o3-app-name': (headersObj.get ? headersObj.get('x-o3-app-name') : headersObj['x-o3-app-name']) || 'turbo-pvz-ui',
+                    'x-o3-app-version': (headersObj.get ? headersObj.get('x-o3-app-version') : headersObj['x-o3-app-version']) || '',
+                    'x-o3-version-name': (headersObj.get ? headersObj.get('x-o3-version-name') : headersObj['x-o3-version-name']) || ''
+                };
+            }
+        } catch (e) {}
+    }
+
+    function interceptPayload(url, data, status = 200) {
         if (url.includes('/api2/giveout/Sessions/close')) {
             let closedId = null;
             if (typeof data === 'string') {
@@ -253,13 +348,19 @@
             } else if (data && data.sessionId) {
                 closedId = data.sessionId;
             }
-            finalizeActiveSession(closedId);
+            finalizeActiveSession(closedId, 'completed');
         }
 
         if (url.includes('/api2/giveout/Postings?sessionId=')) {
             const match = url.match(/sessionId=(\d+)/);
             if (match && data) {
                 handleSessionPostingsData(match[1], data);
+            }
+        }
+
+        if (url.includes('/api2/giveout/Payment') || url.includes('/api2/giveout/Sessions/pay')) {
+            if (status >= 400) {
+                recordTimelineEvent(null, 'payment_failed', '❌ ОШИБКА ПРОВЕДЕНИЯ ОПЛАТЫ', true);
             }
         }
 
@@ -276,24 +377,36 @@
 
     const origOpen = XMLHttpRequest.prototype.open;
     const origSend = XMLHttpRequest.prototype.send;
+    const origSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
 
     XMLHttpRequest.prototype.open = function(method, url) {
         this._bUrl = typeof url === 'string' ? url : '';
+        this._bHeaders = {};
         return origOpen.apply(this, arguments);
     };
 
+    XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+        if (this._bHeaders) this._bHeaders[name.toLowerCase()] = value;
+        return origSetRequestHeader.apply(this, arguments);
+    };
+
     XMLHttpRequest.prototype.send = function() {
+        if (this._bHeaders) captureAuthToken(this._bHeaders);
         const body = arguments[0];
+        const self = this;
         this.addEventListener('load', function() {
             try {
-                if (this._bUrl.includes('/api2/giveout/Sessions/close')) {
-                    interceptPayload(this._bUrl, body);
+                if (self._bUrl.includes('/api2/giveout/Sessions/close')) {
+                    interceptPayload(self._bUrl, body, self.status);
                 }
-                if (this._bUrl.includes('/api2/giveout/Postings?sessionId=')) {
-                    interceptPayload(this._bUrl, JSON.parse(this.responseText));
+                if (self._bUrl.includes('/api2/giveout/Postings?sessionId=')) {
+                    interceptPayload(self._bUrl, JSON.parse(self.responseText), self.status);
                 }
-                if (this._bUrl.includes('/api2/giveout/Sessions')) {
-                    interceptPayload(this._bUrl, JSON.parse(this.responseText));
+                if (self._bUrl.includes('/api2/giveout/Sessions')) {
+                    interceptPayload(self._bUrl, JSON.parse(self.responseText), self.status);
+                }
+                if (self._bUrl.includes('/Payment') || self._bUrl.includes('/pay')) {
+                    interceptPayload(self._bUrl, null, self.status);
                 }
             } catch (e) {}
         });
@@ -302,23 +415,48 @@
 
     const origFetch = window.fetch;
     window.fetch = async function(...args) {
+        try {
+            const config = args[1];
+            if (config && config.headers) {
+                captureAuthToken(new Headers(config.headers));
+            }
+        } catch (e) {}
+
         const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
         const response = await origFetch.apply(this, args);
 
         try {
             if (url.includes('/api2/giveout/Sessions/close')) {
-                interceptPayload(url, args[1]?.body);
+                interceptPayload(url, args[1]?.body, response.status);
             }
             if (url.includes('/api2/giveout/Postings?sessionId=')) {
-                response.clone().json().then(data => interceptPayload(url, data)).catch(() => {});
+                response.clone().json().then(data => interceptPayload(url, data, response.status)).catch(() => {});
             }
             if (url.includes('/api2/giveout/Sessions')) {
-                response.clone().json().then(data => interceptPayload(url, data)).catch(() => {});
+                response.clone().json().then(data => interceptPayload(url, data, response.status)).catch(() => {});
+            }
+            if (url.includes('/Payment') || url.includes('/pay')) {
+                interceptPayload(url, null, response.status);
             }
         } catch (e) {}
 
         return response;
     };
+
+    window.addEventListener('beforeunload', () => {
+        finalizeActiveSession(null, 'tab_unloaded');
+    });
+
+    document.addEventListener('click', (e) => {
+        if (e.target.closest('.apple-close-btn')) {
+            const card = e.target.closest('.apple-session-card');
+            const sId = card?.dataset?.sessionId;
+            if (sId) finalizeActiveSession(sId, 'manual_dock');
+        }
+        if (e.target.closest('button') && e.target.closest('button').querySelector('path[d^="M6.293 2.293"]')) {
+            finalizeActiveSession(null, 'manual_back');
+        }
+    }, true);
 
     window.addEventListener('keydown', function(e) {
         if (e.ctrlKey && e.shiftKey && e.altKey && e.code === 'KeyB') {
@@ -333,7 +471,7 @@
             if (modal) {
                 e.preventDefault();
                 e.stopPropagation();
-                modal.remove();
+                closeInspectorModal();
                 return;
             }
         }
@@ -361,7 +499,8 @@
         const currentOp = getOperatorLogin();
         const activeId = getActiveSessionIdOnTab();
 
-        if (clean.includes('*')) {
+        const isClientBarcode = /^\d{5,12}\*\d{3,6}$/.test(clean);
+        if (isClientBarcode) {
             const parts = clean.split('*');
             const cId = parts[0];
             sessionStorage.setItem('client_code_pending', barcode);
@@ -396,7 +535,7 @@
                         if (res.isOzonArticle) {
                             recordTimelineEvent(activeId, 'alien_scan', `⚠️ ЧУЖОЙ ТОВАР СО СКЛАДА: ${barcode} (${res.name})`, true, { barcode, isRealParcel: true });
                         } else {
-                            recordTimelineEvent(activeId, 'junk_scan', `ℹ️ Случайный/Внешний ШК: ${barcode}`, false, { barcode, isRealParcel: false });
+                            recordTimelineEvent(activeId, 'junk_scan', `ℹ️ Служебный/Внешний ШК: ${barcode}`, false, { barcode, isRealParcel: false });
                         }
                     });
                 }
@@ -417,7 +556,7 @@
         #blackbox-modal-root {
             position: fixed !important;
             top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important;
-            background: rgba(2, 6, 23, 0.78) !important;
+            background: rgba(2, 6, 23, 0.8) !important;
             backdrop-filter: blur(20px) saturate(180%) !important;
             -webkit-backdrop-filter: blur(20px) saturate(180%) !important;
             z-index: 10000000 !important;
@@ -426,20 +565,22 @@
             justify-content: center !important;
             font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif !important;
             color: #f8fafc !important;
+            overscroll-behavior: contain !important;
         }
 
         .bb-window {
-            width: 960px !important;
-            max-width: 95vw !important;
-            height: 740px !important;
-            max-height: 90vh !important;
+            width: 1040px !important;
+            max-width: 96vw !important;
+            height: 760px !important;
+            max-height: 92vh !important;
             background: #0f172a !important;
             border: 1px solid rgba(255, 255, 255, 0.12) !important;
             border-radius: 16px !important;
-            box-shadow: 0 24px 60px rgba(0, 0, 0, 0.7) !important;
+            box-shadow: 0 24px 60px rgba(0, 0, 0, 0.75) !important;
             display: flex !important;
             flex-direction: column !important;
             overflow: hidden !important;
+            overscroll-behavior: contain !important;
         }
 
         .bb-header {
@@ -483,9 +624,9 @@
         .bb-close { color: #64748b !important; cursor: pointer !important; font-size: 18px !important; padding: 2px 6px !important; }
         .bb-close:hover { color: #fff !important; }
 
-        .bb-body { flex: 1 1 auto !important; display: flex !important; overflow: hidden !important; }
-        .bb-main-view { flex: 1 1 auto !important; padding: 16px !important; overflow-y: auto !important; display: flex !important; flex-direction: column !important; gap: 10px !important; }
-        .bb-replay-view { width: 420px !important; min-width: 420px !important; border-left: 1px solid rgba(255, 255, 255, 0.08) !important; background: #090d16 !important; padding: 16px !important; display: flex !important; flex-direction: column !important; gap: 10px !important; overflow-y: auto !important; }
+        .bb-body { flex: 1 1 auto !important; display: flex !important; overflow: hidden !important; overscroll-behavior: contain !important; }
+        .bb-main-view { flex: 1 1 auto !important; padding: 16px !important; overflow-y: auto !important; display: flex !important; flex-direction: column !important; gap: 10px !important; overscroll-behavior: contain !important; }
+        .bb-replay-view { width: 440px !important; min-width: 440px !important; border-left: 1px solid rgba(255, 255, 255, 0.08) !important; background: #090d16 !important; padding: 16px !important; display: flex !important; flex-direction: column !important; gap: 10px !important; overflow-y: auto !important; overscroll-behavior: contain !important; }
 
         .bb-input {
             background: rgba(255, 255, 255, 0.05) !important;
@@ -495,21 +636,39 @@
             border-radius: 8px !important;
             font-size: 13px !important;
             outline: none !important;
-            width: 100% !important;
             box-sizing: border-box !important;
         }
         .bb-input:focus { border-color: #38bdf8 !important; }
 
-        .bb-date-divider {
-            font-size: 11px !important;
-            font-weight: 800 !important;
-            text-transform: uppercase !important;
-            letter-spacing: 0.6px !important;
+        .bb-filter-row {
+            display: flex !important;
+            gap: 8px !important;
+            width: 100% !important;
+        }
+
+        .bb-accordion {
+            border: 1px solid rgba(255, 255, 255, 0.08) !important;
+            border-radius: 10px !important;
+            background: rgba(255, 255, 255, 0.01) !important;
+            overflow: hidden !important;
+        }
+        .bb-accordion-summary {
+            padding: 10px 14px !important;
+            font-size: 12px !important;
+            font-weight: 700 !important;
             color: #38bdf8 !important;
-            background: rgba(56, 189, 248, 0.08) !important;
-            padding: 4px 10px !important;
-            border-radius: 6px !important;
-            margin-top: 6px !important;
+            cursor: pointer !important;
+            display: flex !important;
+            justify-content: space-between !important;
+            align-items: center !important;
+            background: rgba(56, 189, 248, 0.06) !important;
+            user-select: none !important;
+        }
+        .bb-accordion-body {
+            padding: 8px !important;
+            display: flex !important;
+            flex-direction: column !important;
+            gap: 6px !important;
         }
 
         .bb-card {
@@ -553,19 +712,51 @@
         .bb-timeline-node.alien::before { background: #ef4444; box-shadow: 0 0 8px #ef4444; }
         .bb-timeline-time { font-size: 10px; color: #64748b; font-family: monospace; }
         .bb-timeline-text { font-size: 12px; color: #e2e8f0; font-weight: 500; }
+
+        .bb-btn {
+            background: #1c3557;
+            color: #38bdf8;
+            border: 1px solid #2b4260;
+            padding: 8px 14px;
+            border-radius: 8px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .bb-btn:hover { background: #007aff; color: #fff; }
+        .bb-btn-danger { background: rgba(239, 68, 68, 0.15); color: #f87171; border-color: rgba(239, 68, 68, 0.3); }
+        .bb-btn-danger:hover { background: #ef4444; color: #fff; }
+
+        .bb-notice-bar {
+            background: rgba(56, 189, 248, 0.12);
+            border: 1px solid rgba(56, 189, 248, 0.3);
+            color: #38bdf8;
+            padding: 8px 12px;
+            border-radius: 8px;
+            font-size: 12px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
     `;
     document.head.appendChild(modalStyle);
 
     function toggleInspectorModal() {
         let m = document.getElementById('blackbox-modal-root');
-        if (m) {
-            m.remove();
-            return;
-        }
-        openInspector();
+        if (m) closeInspectorModal();
+        else openInspector();
     }
 
-    async function openInspector() {
+    function closeInspectorModal() {
+        const m = document.getElementById('blackbox-modal-root');
+        if (m) m.remove();
+        document.body.style.overflow = '';
+    }
+
+    function openInspector() {
+        document.body.style.overflow = 'hidden';
         const modal = document.createElement('div');
         modal.id = 'blackbox-modal-root';
         modal.innerHTML = `
@@ -590,7 +781,7 @@
         `;
         document.body.appendChild(modal);
 
-        modal.querySelector('#bb-close-btn').onclick = () => modal.remove();
+        modal.querySelector('#bb-close-btn').onclick = closeInspectorModal;
 
         const tabs = modal.querySelectorAll('.bb-tab-btn');
         tabs.forEach(t => {
@@ -604,17 +795,47 @@
         renderTabContent('sessions');
     }
 
+    function formatDateKey(timestamp) {
+        const d = new Date(timestamp);
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    }
+
     function formatDateDivider(timestamp) {
         const d = new Date(timestamp);
         const now = new Date();
         const isToday = d.toDateString() === now.toDateString();
         const yesterday = new Date(now);
         yesterday.setDate(now.getDate() - 1);
-        const isYesterday = d.toDateString() === yesterday.toDateString();
-
         if (isToday) return 'Сегодня';
-        if (isYesterday) return 'Вчера';
+        if (d.toDateString() === yesterday.toDateString()) return 'Вчера';
         return d.toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' });
+    }
+
+    function buildCsvData(sessions) {
+        const header = ['Дата', 'Время', 'Клиент', 'ClientId', 'Код_Выдачи', 'Оператор', 'Ячейки', 'Всего_товаров', 'Длительность_сек', 'Причина_закрытия', 'Чужих_сканов'];
+        const rows = [header.join(';')];
+
+        sessions.forEach(s => {
+            const d = new Date(s.foundAt);
+            const dateStr = d.toLocaleDateString('ru-RU');
+            const timeStr = d.toLocaleTimeString('ru-RU');
+            const row = [
+                dateStr,
+                timeStr,
+                `"${(s.clientName || '').replace(/"/g, '""')}"`,
+                s.clientId || '',
+                s.pickupCode || '',
+                s.operator || '',
+                `"${(s.shelves || '').replace(/"/g, '""')}"`,
+                s.postings?.length || 0,
+                s.durationSec || 0,
+                s.closeReason || '',
+                s.alienScans?.length || 0
+            ];
+            rows.push(row.join(';'));
+        });
+
+        return rows.join('\r\n');
     }
 
     async function renderTabContent(tab) {
@@ -624,13 +845,24 @@
 
         if (tab === 'sessions') {
             sidebar.style.display = 'flex';
-            const sessions = await dbGetAll('sessions');
+            let sessions = externalDumpData ? externalDumpData.sessions : await dbGetAll('sessions');
             sessions.sort((a, b) => b.foundAt - a.foundAt);
 
             container.innerHTML = `
-                <input type="text" class="bb-input" id="bb-session-search" placeholder="Поиск по клиенту или штрихкоду...">
+                ${externalDumpData ? `<div class="bb-notice-bar"><span>📂 Просмотр внешнего дампа (${sessions.length} сессий)</span><button class="bb-btn" id="bb-exit-dump-view" style="padding: 2px 8px;">Вернуться в свою базу</button></div>` : ''}
+                <div class="bb-filter-row">
+                    <input type="text" class="bb-input" id="bb-session-search" placeholder="Поиск по клиенту, штрихкоду, ячейке...">
+                    <input type="text" class="bb-input" id="bb-shelf-search" placeholder="Ячейка..." style="width: 120px;">
+                </div>
                 <div id="bb-sessions-list" style="display: flex; flex-direction: column; gap: 8px;"></div>
             `;
+
+            if (externalDumpData) {
+                container.querySelector('#bb-exit-dump-view').onclick = () => {
+                    externalDumpData = null;
+                    renderTabContent('sessions');
+                };
+            }
 
             const listEl = container.querySelector('#bb-sessions-list');
 
@@ -641,72 +873,96 @@
                     return;
                 }
 
-                let lastDateHeader = '';
-
+                const grouped = {};
                 items.forEach((s, idx) => {
-                    const dateHeader = formatDateDivider(s.foundAt);
-                    if (dateHeader !== lastDateHeader) {
-                        lastDateHeader = dateHeader;
-                        const divEl = document.createElement('div');
-                        divEl.className = 'bb-date-divider';
-                        divEl.textContent = dateHeader;
-                        listEl.appendChild(divEl);
-                    }
+                    const key = formatDateKey(s.foundAt);
+                    if (!grouped[key]) grouped[key] = [];
+                    grouped[key].push({ s, idx });
+                });
 
-                    const hasAlien = s.alienScans && s.alienScans.some(a => a.isRealParcel);
-                    
-                    const isRepeat = s.clientId && items.some((other, oIdx) => {
-                        return oIdx !== idx && other.clientId === s.clientId && Math.abs(s.foundAt - other.foundAt) < (24 * 3600 * 1000);
-                    });
+                Object.keys(grouped).forEach(k => {
+                    const groupItems = grouped[k];
+                    const firstDate = groupItems[0].s.foundAt;
+                    const dateTitle = formatDateDivider(firstDate);
 
-                    const isParallel = items.some((other, oIdx) => {
-                        if (oIdx === idx || !s.closedAt || !other.closedAt) return false;
-                        return (s.foundAt >= other.foundAt && s.foundAt <= other.closedAt) || (other.foundAt >= s.foundAt && other.foundAt <= s.closedAt);
-                    });
+                    const details = document.createElement('details');
+                    details.className = 'bb-accordion';
+                    details.open = true;
 
-                    const date = new Date(s.foundAt);
-                    const timeStr = `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
-
-                    const card = document.createElement('div');
-                    card.className = `bb-card ${hasAlien ? 'has-alien' : ''}`;
-                    card.innerHTML = `
-                        <div class="bb-card-head">
-                            <span class="bb-card-name">${s.clientName || 'Без имени'}</span>
-                            <span class="bb-card-time">${timeStr} (${s.durationSec}с)</span>
-                        </div>
-                        <div class="bb-card-sub">
-                            <span>📦 ${s.postings?.length || 0} тов.</span>
-                            <span>Яч. ${s.shelves || '—'}</span>
-                            <span>👤 ${s.operator || '—'}</span>
-                            ${hasAlien ? `<span class="bb-tag bb-tag-warn">⚠️ Чужой пик</span>` : ''}
-                            ${isRepeat ? `<span class="bb-tag bb-tag-repeat">🔄 Повтор за 24ч</span>` : ''}
-                            ${isParallel ? `<span class="bb-tag bb-tag-parallel">⚡ Параллельно</span>` : ''}
-                        </div>
+                    details.innerHTML = `
+                        <summary class="bb-accordion-summary">
+                            <span>${dateTitle}</span>
+                            <span style="color: rgba(255,255,255,0.4);">${groupItems.length} сессий</span>
+                        </summary>
+                        <div class="bb-accordion-body"></div>
                     `;
-                    card.onclick = () => renderSessionReplay(s);
-                    listEl.appendChild(card);
+
+                    const body = details.querySelector('.bb-accordion-body');
+
+                    groupItems.forEach(({ s, idx }) => {
+                        const hasAlien = s.alienScans && s.alienScans.some(a => a.isRealParcel);
+                        const isRepeat = s.clientId && items.some((other, oIdx) => oIdx !== idx && other.clientId === s.clientId && Math.abs(s.foundAt - other.foundAt) < (24 * 3600 * 1000));
+                        const isParallel = items.some((other, oIdx) => {
+                            if (oIdx === idx || !s.closedAt || !other.closedAt) return false;
+                            return (s.foundAt >= other.foundAt && s.foundAt <= other.closedAt) || (other.foundAt >= s.foundAt && other.foundAt <= s.closedAt);
+                        });
+
+                        const date = new Date(s.foundAt);
+                        const timeStr = `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+
+                        const card = document.createElement('div');
+                        card.className = `bb-card ${hasAlien ? 'has-alien' : ''}`;
+                        card.innerHTML = `
+                            <div class="bb-card-head">
+                                <span class="bb-card-name">${s.clientName || 'Без имени'}</span>
+                                <span class="bb-card-time">${timeStr} (${s.durationSec || 0}с)</span>
+                            </div>
+                            <div class="bb-card-sub">
+                                <span>📦 ${s.postings?.length || 0} тов.</span>
+                                <span>Яч. ${s.shelves || '—'}</span>
+                                <span>👤 ${s.operator || '—'}</span>
+                                ${hasAlien ? `<span class="bb-tag bb-tag-warn">⚠️ Чужой пик</span>` : ''}
+                                ${isRepeat ? `<span class="bb-tag bb-tag-repeat">🔄 Повтор за 24ч</span>` : ''}
+                                ${isParallel ? `<span class="bb-tag bb-tag-parallel">⚡ Параллельно</span>` : ''}
+                            </div>
+                        `;
+                        card.onclick = () => renderSessionReplay(s);
+                        body.appendChild(card);
+                    });
+
+                    listEl.appendChild(details);
                 });
             }
 
             populate(sessions);
 
-            container.querySelector('#bb-session-search').oninput = (e) => {
-                const query = e.target.value.toLowerCase().trim();
+            const searchInp = container.querySelector('#bb-session-search');
+            const shelfInp = container.querySelector('#bb-shelf-search');
+
+            function applyFilters() {
+                const q = searchInp.value.toLowerCase().trim();
+                const sh = shelfInp.value.toLowerCase().trim();
+
                 const filtered = sessions.filter(s => {
-                    const matchName = (s.clientName || '').toLowerCase().includes(query);
-                    const matchId = (s.clientId || '').toLowerCase().includes(query);
-                    const matchCode = (s.pickupCode || '').toLowerCase().includes(query);
-                    const matchBarcode = s.postings?.some(p => (p.barcode && p.barcode.toLowerCase().includes(query)) || p.allBarcodes?.some(b => b.includes(query)));
-                    return matchName || matchId || matchCode || matchBarcode;
+                    const matchName = (s.clientName || '').toLowerCase().includes(q);
+                    const matchId = (s.clientId || '').toLowerCase().includes(q);
+                    const matchCode = (s.pickupCode || '').toLowerCase().includes(q);
+                    const matchBarcode = s.postings?.some(p => (p.barcode && p.barcode.toLowerCase().includes(q)) || p.allBarcodes?.some(b => b.includes(q)));
+                    const matchShelf = !sh || (s.shelves || '').toLowerCase().includes(sh);
+
+                    return (matchName || matchId || matchCode || matchBarcode) && matchShelf;
                 });
                 populate(filtered);
-            };
+            }
+
+            searchInp.oninput = applyFilters;
+            shelfInp.oninput = applyFilters;
         }
 
         if (tab === 'lookup') {
             sidebar.style.display = 'none';
             container.innerHTML = `
-                <div style="font-size: 13px; color: #94a3b8; margin-bottom: 4px;">Введите штрихкод потерянного товара для поиска в истории сканов:</div>
+                <div style="font-size: 13px; color: #94a3b8; margin-bottom: 4px;">Поиск перемещений штрихкода по всей базе:</div>
                 <input type="text" class="bb-input" id="bb-lookup-input" placeholder="Вставьте ШК товара...">
                 <div id="bb-lookup-results" style="display: flex; flex-direction: column; gap: 8px; margin-top: 10px;"></div>
             `;
@@ -721,11 +977,11 @@
                     return;
                 }
 
-                const allScans = await dbGetAll('scans_history');
-                const matched = allScans.filter(sc => (sc.barcode || '').toLowerCase().includes(val));
+                const allScans = externalDumpData ? externalDumpData.scans : await dbGetAll('scans_history');
+                const matched = (allScans || []).filter(sc => (sc.barcode || '').toLowerCase().includes(val));
 
                 if (matched.length === 0) {
-                    resEl.innerHTML = '<div style="color: #64748b; padding: 15px;">Штрихкод ни разу не сканировался на этом ПК</div>';
+                    resEl.innerHTML = '<div style="color: #64748b; padding: 15px;">Штрихкод не найден в реестре</div>';
                     return;
                 }
 
@@ -740,6 +996,7 @@
                                 <span class="bb-card-time">${time}</span>
                             </div>
                             <div class="bb-card-sub">
+                                <span>Сессия: <b>${m.clientName || 'Вне сессии'}</b></span>
                                 <span>Оператор: <b>${m.operator}</b></span>
                                 ${m.isAlien ? '<span class="bb-tag bb-tag-warn">⚠️ ПИКНУТ В ЧУЖОМ ЗАКАЗЕ</span>' : ''}
                             </div>
@@ -751,16 +1008,16 @@
 
         if (tab === 'aliens') {
             sidebar.style.display = 'none';
-            const sessions = await dbGetAll('sessions');
-            const alienSessions = sessions.filter(s => s.alienScans && s.alienScans.some(a => a.isRealParcel));
+            const sessions = externalDumpData ? externalDumpData.sessions : await dbGetAll('sessions');
+            const alienSessions = (sessions || []).filter(s => s.alienScans && s.alienScans.some(a => a.isRealParcel));
 
             if (alienSessions.length === 0) {
-                container.innerHTML = '<div style="color: #10b981; font-weight: bold; text-align: center; padding: 40px;">✅ Чужих сканов и аномалий не зафиксировано!</div>';
+                container.innerHTML = '<div style="color: #10b981; font-weight: bold; text-align: center; padding: 40px;">✅ Чужих сканов товаров Ozon не зафиксировано!</div>';
                 return;
             }
 
             container.innerHTML = `
-                <div style="font-size: 13px; color: #ef4444; font-weight: bold; margin-bottom: 6px;">Реестр опасных сканов (товар со склада не принадлежал клиенту на момент пика):</div>
+                <div style="font-size: 13px; color: #ef4444; font-weight: bold; margin-bottom: 6px;">Реестр опасных сканов (товар принадлежал другому клиенту/складу):</div>
                 <div style="display: flex; flex-direction: column; gap: 8px;">
                     ${alienSessions.map(s => `
                         <div class="bb-card has-alien">
@@ -770,6 +1027,7 @@
                             </div>
                             <div class="bb-card-sub">
                                 <span>Оператор: <b>${s.operator}</b></span>
+                                <span>Ячейки: <b>${s.shelves || '—'}</b></span>
                             </div>
                             <div style="margin-top: 6px; font-size: 12px; color: #f87171;">
                                 ${s.alienScans.filter(a => a.isRealParcel).map(a => `<div>• [${new Date(a.time).toLocaleTimeString()}] ${a.text}</div>`).join('')}
@@ -792,34 +1050,42 @@
             }
 
             container.innerHTML = `
-                <div style="display: flex; flex-direction: column; gap: 14px; max-width: 500px;">
+                <div style="display: flex; flex-direction: column; gap: 14px; max-width: 580px;">
                     <div style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); padding: 14px; border-radius: 10px;">
-                        <div style="font-weight: bold; margin-bottom: 6px;">Статистика локальной базы IndexedDB</div>
-                        <div style="font-size: 12px; color: #94a3b8;">Сохранено сессий: <b>${sessions.length}</b></div>
+                        <div style="font-weight: bold; margin-bottom: 6px;">Статистика локального хранилища</div>
+                        <div style="font-size: 12px; color: #94a3b8;">Сохранено сессий в базе: <b>${sessions.length}</b></div>
                         <div style="font-size: 12px; color: #94a3b8;">Всего сканов в реестре: <b>${scans.length}</b></div>
-                        <div style="font-size: 12px; color: #94a3b8;">Занято дискового пространства: <b>${estSize} МБ</b></div>
+                        <div style="font-size: 12px; color: #94a3b8;">Занято дискового пространства: <b>${estSize} МБ</b> (Хранение 180 дней)</div>
                     </div>
 
-                    <div style="display: flex; gap: 10px;">
-                        <button class="bb-tab-btn active" id="bb-export-btn" style="padding: 10px 16px;">💾 Выгрузить дамп (JSON)</button>
-                        <button class="bb-tab-btn" id="bb-import-btn" style="padding: 10px 16px;">📥 Слияние со вторым ПК</button>
+                    <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                        <button class="bb-btn" id="bb-export-json">💾 Дамп JSON</button>
+                        <button class="bb-btn" id="bb-export-csv">📊 Экспорт Excel (CSV)</button>
+                        <button class="bb-btn" id="bb-import-btn">📥 Слияние баз</button>
+                        <button class="bb-btn" id="bb-view-dump-btn" style="background: #0284c7; color: #fff;">📂 Открыть чужой дамп</button>
                         <input type="file" id="bb-import-file" accept=".json" style="display: none;">
+                        <input type="file" id="bb-view-file" accept=".json" style="display: none;">
                     </div>
-                    <div id="bb-import-status" style="font-size: 12px; color: #10b981;"></div>
+
+                    ${ENABLE_DEV_PURGE ? `
+                    <div style="margin-top: 20px; padding-top: 14px; border-top: 1px solid rgba(239, 68, 68, 0.2);">
+                        <button class="bb-btn bb-btn-danger" id="bb-purge-btn">⚠️ Очистить тестовую базу (DEV)</button>
+                    </div>` : ''}
+
+                    <div id="bb-storage-status" style="font-size: 12px; color: #10b981;"></div>
                 </div>
             `;
 
-            container.querySelector('#bb-export-btn').onclick = () => {
+            container.querySelector('#bb-export-json').onclick = () => {
                 const dump = { sessions, scans, exportedAt: Date.now() };
                 const blob = new Blob([JSON.stringify(dump, null, 2)], { type: 'application/json' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = `blackbox_dump_${Date.now()}.json`;
-                document.body.appendChild(a);
-                a.click();
-                a.remove();
-                URL.revokeObjectURL(url);
+                downloadBlob(blob, `blackbox_dump_${Date.now()}.json`);
+            };
+
+            container.querySelector('#bb-export-csv').onclick = () => {
+                const csv = buildCsvData(sessions);
+                const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
+                downloadBlob(blob, `blackbox_export_${Date.now()}.csv`);
             };
 
             const fileInp = container.querySelector('#bb-import-file');
@@ -845,31 +1111,75 @@
                                 await dbPut('scans_history', sc);
                             }
                         }
-                        container.querySelector('#bb-import-status').textContent = `✅ Успешно объединено! Добавлено/обновлено сессий: ${addedSessions}`;
+                        container.querySelector('#bb-storage-status').textContent = `✅ Успешно склеено! Обновлено сессий: ${addedSessions}`;
                     } catch (err) {
-                        container.querySelector('#bb-import-status').textContent = '❌ Ошибка чтения файла';
+                        container.querySelector('#bb-storage-status').textContent = '❌ Ошибка чтения файла дампа';
                     }
                 };
                 reader.readAsText(file);
             };
+
+            const viewInp = container.querySelector('#bb-view-file');
+            container.querySelector('#bb-view-dump-btn').onclick = () => viewInp.click();
+
+            viewInp.onchange = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = (ev) => {
+                    try {
+                        externalDumpData = JSON.parse(ev.target.result);
+                        const tabs = document.querySelectorAll('.bb-tab-btn');
+                        tabs.forEach(tb => tb.classList.remove('active'));
+                        document.querySelector('[data-tab="sessions"]').classList.add('active');
+                        renderTabContent('sessions');
+                    } catch (err) {
+                        container.querySelector('#bb-storage-status').textContent = '❌ Файл поврежден или не является дампом';
+                    }
+                };
+                reader.readAsText(file);
+            };
+
+            if (ENABLE_DEV_PURGE) {
+                container.querySelector('#bb-purge-btn').onclick = async () => {
+                    if (confirm('Стереть ВСЕ накопленные данные из базы? Это действие необратимо.')) {
+                        await clearEntireDB();
+                        renderTabContent('storage');
+                    }
+                };
+            }
         }
+    }
+
+    function downloadBlob(blob, filename) {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
     }
 
     function renderSessionReplay(session) {
         const sidebar = document.getElementById('bb-replay-sidebar');
         if (!sidebar) return;
 
+        const hasCode = session.pickupCode && session.pickupCode.includes('*');
+
         sidebar.innerHTML = `
-            <div style="font-weight: 800; font-size: 14px; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 6px;">
-                Реконструкция: ${session.clientName || 'Без имени'}
+            <div style="font-weight: 800; font-size: 14px; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 6px; display: flex; justify-content: space-between; align-items: center;">
+                <span>Реконструкция: ${session.clientName || 'Без имени'}</span>
+                ${hasCode ? `<button class="bb-btn" id="bb-reopen-order-btn" style="padding: 2px 8px; font-size: 11px;">Повторить выдачу</button>` : ''}
             </div>
             <div style="font-size: 11px; color: #94a3b8; display: flex; flex-direction: column; gap: 2px;">
                 <div>Штрихкод / ID: <b>${session.pickupCode || session.clientId || '—'}</b></div>
                 <div>Оператор: <b>${session.operator || '—'}</b> · Ячейки: <b>${session.shelves || '—'}</b></div>
-                <div>Длительность: <b>${session.durationSec} сек</b></div>
+                <div>Длительность: <b>${session.durationSec || 0} сек</b> (${session.closeReason || 'завершено'})</div>
             </div>
 
-            <div style="font-size: 12px; font-weight: 700; margin-top: 10px; color: #38bdf8;">Товары к выдаче (${session.postings?.length || 0}):</div>
+            <div style="font-size: 12px; font-weight: 700; margin-top: 10px; color: #38bdf8;">Товары заказа (${session.postings?.length || 0}):</div>
             <div style="display: flex; flex-direction: column; gap: 4px;">
                 ${(session.postings || []).map(p => `
                     <div style="font-size: 11px; background: rgba(255,255,255,0.02); padding: 6px 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.05);">
@@ -894,6 +1204,24 @@
                 `).join('')}
             </div>
         `;
+
+        if (hasCode) {
+            sidebar.querySelector('#bb-reopen-order-btn').onclick = () => {
+                closeInspectorModal();
+                sessionStorage.setItem('pending_client_scan', session.pickupCode);
+                if (window.location.pathname === '/orders') {
+                    const input = document.querySelector('[data-testid="searchInput"]');
+                    const btn = document.querySelector('[data-testid="searchButton"]');
+                    if (input && btn) {
+                        input.value = session.pickupCode;
+                        input.dispatchEvent(new Event('input', { bubbles: true }));
+                        setTimeout(() => btn.click(), 80);
+                    }
+                } else {
+                    window.location.href = '/orders';
+                }
+            };
+        }
     }
 
     initDB();
