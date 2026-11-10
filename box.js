@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ozon BlackBox (Forensics & Audit Core)
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  Ozon BlackBox
 // @author       desslow
 // @match        https://*.ozon.ru/*
@@ -13,14 +13,28 @@
     'use strict';
 
     const DB_NAME = 'OzonBlackBoxDB';
-    const DB_VERSION = 1;
+    const DB_VERSION = 2;
     let db = null;
 
-    let activeSession = null;
-    let currentPostingsList = [];
     let scanBuffer = '';
     let lastScanTime = Date.now();
     let currentOperator = '';
+
+    const TAB_ID = Math.random().toString(36).slice(2, 9);
+
+    const RUS_TO_ENG = {
+        'й':'q','ц':'w','у':'e','к':'r','е':'t','н':'y','г':'u','ш':'i','щ':'o','з':'p',
+        'х':'[','ъ':']','ф':'a','ы':'s','в':'d','а':'f','п':'g','р':'h','о':'j','л':'k',
+        'д':'l','ж':';','э':"'",'я':'z','ч':'x','с':'c','м':'v','и':'b','т':'n','ь':'m',
+        'б':',','ю':'.','.':'/','ё':'`','?':',','/':'.'
+    };
+
+    function translit(str) {
+        return str.split('').map(ch => {
+            const low = ch.toLowerCase();
+            return RUS_TO_ENG[low] || ch;
+        }).join('');
+    }
 
     function initDB() {
         return new Promise((resolve, reject) => {
@@ -30,7 +44,7 @@
                 if (!d.objectStoreNames.contains('sessions')) {
                     const sStore = d.createObjectStore('sessions', { keyPath: 'sessionId' });
                     sStore.createIndex('by_closedAt', 'closedAt', { unique: false });
-                    sStore.createIndex('by_clientName', 'clientName', { unique: false });
+                    sStore.createIndex('by_clientId', 'clientId', { unique: false });
                 }
                 if (!d.objectStoreNames.contains('scans_history')) {
                     const scStore = d.createObjectStore('scans_history', { keyPath: 'id', autoIncrement: true });
@@ -64,6 +78,21 @@
         });
     }
 
+    function dbGet(storeName, key) {
+        if (!db) return Promise.resolve(null);
+        return new Promise((resolve) => {
+            try {
+                const tx = db.transaction(storeName, 'readonly');
+                const store = tx.objectStore(storeName);
+                const req = store.get(key);
+                req.onsuccess = () => resolve(req.result || null);
+                req.onerror = () => resolve(null);
+            } catch (e) {
+                resolve(null);
+            }
+        });
+    }
+
     function dbGetAll(storeName) {
         if (!db) return Promise.resolve([]);
         return new Promise((resolve) => {
@@ -83,6 +112,10 @@
         const el = document.querySelector('[class*="_rightAvatarMenuLogin_"]');
         if (el) currentOperator = el.textContent.trim().replace('PVZ_', '');
         return currentOperator;
+    }
+
+    function getActiveSessionIdOnTab() {
+        return (window.location.pathname.match(/\/orders\/session(?:-new)?\/(\d+)/) || [])[1] || null;
     }
 
     function extractPostingDetails(p) {
@@ -107,57 +140,73 @@
         };
     }
 
-    function handleSessionPostingsData(sessionId, data) {
+    async function handleSessionPostingsData(sessionId, data) {
         if (!data || !data.postings) return;
         const sId = String(sessionId);
-        currentPostingsList = Array.isArray(data.postings) ? data.postings : [];
 
+        const readyPostings = (data.postings || []).filter(p => p.pvzState === 'ReadyToGiveout' || !p.pvzState);
+
+        const clientId = data.client?.ozonClientId || (data.client?.clientId) || '';
         const clientName = data.client?.clientShortName || '';
         const shelves = Array.isArray(data.postingsShelves) ? data.postingsShelves.join(', ') : '';
+        const currentCode = sessionStorage.getItem('client_code_' + sId) || (clientId ? `${clientId}*----` : '');
 
-        if (!activeSession || String(activeSession.sessionId) !== sId) {
-            if (activeSession) finalizeActiveSession();
+        let existing = await dbGet('sessions', sId);
 
-            activeSession = {
+        if (!existing) {
+            existing = {
                 sessionId: sId,
+                clientId: String(clientId),
                 clientName: clientName,
-                pickupCode: sessionStorage.getItem('client_code_' + sId) || '',
+                pickupCode: currentCode,
                 foundAt: Date.now(),
                 closedAt: null,
                 durationSec: 0,
                 operator: getOperatorLogin(),
                 shelves: shelves,
-                postings: currentPostingsList.map(extractPostingDetails),
+                postings: readyPostings.map(extractPostingDetails),
                 timeline: [
                     { time: Date.now(), type: 'start', text: 'Сессия открыта' }
                 ],
-                alienScans: []
+                alienScans: [],
+                tabId: TAB_ID
             };
         } else {
-            activeSession.shelves = shelves;
-            if (clientName) activeSession.clientName = clientName;
-            activeSession.postings = currentPostingsList.map(extractPostingDetails);
+            if (clientId) existing.clientId = String(clientId);
+            if (clientName) existing.clientName = clientName;
+            if (shelves) existing.shelves = shelves;
+            if (currentCode) existing.pickupCode = currentCode;
+            existing.postings = readyPostings.map(extractPostingDetails);
         }
+
+        await dbPut('sessions', existing);
     }
 
-    function recordTimelineEvent(type, text, isAlien = false, extraData = {}) {
-        if (!activeSession) return;
+    async function recordTimelineEvent(sId, type, text, isAlien = false, extraData = {}) {
+        if (!sId) return;
+        const session = await dbGet('sessions', String(sId));
+        if (!session) return;
+
         const ev = { time: Date.now(), type, text, isAlien, ...extraData };
-        activeSession.timeline.push(ev);
+        session.timeline.push(ev);
         if (isAlien) {
-            activeSession.alienScans.push(ev);
+            session.alienScans.push(ev);
         }
+        await dbPut('sessions', session);
     }
 
-    function finalizeActiveSession(sId) {
-        if (!activeSession) return;
-        if (sId && String(activeSession.sessionId) !== String(sId)) return;
+    async function finalizeActiveSession(sId) {
+        const targetId = sId ? String(sId) : getActiveSessionIdOnTab();
+        if (!targetId) return;
 
-        activeSession.closedAt = Date.now();
-        activeSession.durationSec = Math.max(1, Math.round((activeSession.closedAt - activeSession.foundAt) / 1000));
-        activeSession.operator = getOperatorLogin() || activeSession.operator;
+        const session = await dbGet('sessions', targetId);
+        if (!session || session.closedAt) return;
 
-        activeSession.postings.forEach(pObj => {
+        session.closedAt = Date.now();
+        session.durationSec = Math.max(1, Math.round((session.closedAt - session.foundAt) / 1000));
+        session.operator = getOperatorLogin() || session.operator;
+
+        session.postings.forEach(pObj => {
             const cardWrapper = document.querySelector(`[data-testid="${pObj.id}"]`);
             if (cardWrapper) {
                 const txt = cardWrapper.textContent;
@@ -173,11 +222,27 @@
             }
         });
 
-        activeSession.timeline.push({ time: Date.now(), type: 'finish', text: 'Сессия завершена' });
+        session.timeline.push({ time: Date.now(), type: 'finish', text: 'Сессия завершена' });
 
-        dbPut('sessions', activeSession);
-        activeSession = null;
-        currentPostingsList = [];
+        await dbPut('sessions', session);
+    }
+
+    async function verifyOzonArticle(barcode) {
+        try {
+            const res = await fetch('https://turbo-pvz.ozon.ru/p-api/article-tracking/Entity/Find', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/plain, */*' },
+                body: JSON.stringify({ isManualInput: false, name: barcode }),
+                credentials: 'same-origin'
+            });
+            if (res.ok) {
+                const data = await res.json();
+                if (data.entity && data.entity.id) {
+                    return { isOzonArticle: true, name: data.entity.name || '' };
+                }
+            }
+        } catch (e) {}
+        return { isOzonArticle: false };
     }
 
     function interceptPayload(url, data) {
@@ -195,6 +260,16 @@
             const match = url.match(/sessionId=(\d+)/);
             if (match && data) {
                 handleSessionPostingsData(match[1], data);
+            }
+        }
+
+        if (url.includes('/api2/giveout/Sessions') && !url.includes('/close')) {
+            if (data && Array.isArray(data.sessions)) {
+                data.sessions.forEach(s => {
+                    if (s.sessionId && s.clientId) {
+                        sessionStorage.setItem('client_id_' + s.sessionId, String(s.clientId));
+                    }
+                });
             }
         }
     }
@@ -217,6 +292,9 @@
                 if (this._bUrl.includes('/api2/giveout/Postings?sessionId=')) {
                     interceptPayload(this._bUrl, JSON.parse(this.responseText));
                 }
+                if (this._bUrl.includes('/api2/giveout/Sessions')) {
+                    interceptPayload(this._bUrl, JSON.parse(this.responseText));
+                }
             } catch (e) {}
         });
         return origSend.apply(this, arguments);
@@ -232,6 +310,9 @@
                 interceptPayload(url, args[1]?.body);
             }
             if (url.includes('/api2/giveout/Postings?sessionId=')) {
+                response.clone().json().then(data => interceptPayload(url, data)).catch(() => {});
+            }
+            if (url.includes('/api2/giveout/Sessions')) {
                 response.clone().json().then(data => interceptPayload(url, data)).catch(() => {});
             }
         } catch (e) {}
@@ -262,51 +343,72 @@
         lastScanTime = now;
 
         if (e.key === 'Enter') {
-            const scanned = scanBuffer.trim();
+            const raw = scanBuffer.trim();
             scanBuffer = '';
 
-            if (scanned.length >= 4) {
-                processBarcodeScan(scanned);
+            if (raw.length >= 4) {
+                const cleaned = translit(raw);
+                processBarcodeScan(cleaned);
             }
         } else if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
             scanBuffer += e.key;
         }
     }, true);
 
-    function processBarcodeScan(barcode) {
+    async function processBarcodeScan(barcode) {
         const clean = barcode.toLowerCase();
         const now = Date.now();
         const currentOp = getOperatorLogin();
+        const activeId = getActiveSessionIdOnTab();
 
         if (clean.includes('*')) {
+            const parts = clean.split('*');
+            const cId = parts[0];
             sessionStorage.setItem('client_code_pending', barcode);
+            if (activeId) {
+                sessionStorage.setItem('client_code_' + activeId, barcode);
+                const s = await dbGet('sessions', String(activeId));
+                if (s) {
+                    s.pickupCode = barcode;
+                    s.clientId = cId;
+                    await dbPut('sessions', s);
+                }
+            }
             return;
         }
 
         let isMatchInCurrent = false;
 
-        if (activeSession && currentPostingsList.length > 0) {
-            isMatchInCurrent = currentPostingsList.some(p => {
-                const pId = String(p.id).toLowerCase();
-                const pBar = (p.displayBarcode1 || '').toLowerCase();
-                const bList = (p.barcodes || []).map(b => String(b).toLowerCase());
-                return pId.includes(clean) || clean.includes(pId) || pBar.includes(clean) || clean.includes(pBar) || bList.some(b => b.includes(clean));
-            });
+        if (activeId) {
+            const session = await dbGet('sessions', String(activeId));
+            if (session && session.postings) {
+                isMatchInCurrent = session.postings.some(p => {
+                    const pId = String(p.id).toLowerCase();
+                    const pBar = (p.barcode || '').toLowerCase();
+                    const bList = (p.allBarcodes || []).map(b => String(b).toLowerCase());
+                    return pId.includes(clean) || clean.includes(pId) || pBar.includes(clean) || clean.includes(pBar) || bList.some(b => b.includes(clean));
+                });
 
-            if (isMatchInCurrent) {
-                recordTimelineEvent('scan', `Отсканирован товар: ${barcode}`, false, { barcode });
-            } else {
-                recordTimelineEvent('alien_scan', `⚠️ ЧУЖОЙ ПИК: ${barcode}`, true, { barcode });
+                if (isMatchInCurrent) {
+                    recordTimelineEvent(activeId, 'scan', `Отсканирован товар: ${barcode}`, false, { barcode });
+                } else {
+                    verifyOzonArticle(barcode).then(res => {
+                        if (res.isOzonArticle) {
+                            recordTimelineEvent(activeId, 'alien_scan', `⚠️ ЧУЖОЙ ТОВАР СО СКЛАДА: ${barcode} (${res.name})`, true, { barcode, isRealParcel: true });
+                        } else {
+                            recordTimelineEvent(activeId, 'junk_scan', `ℹ️ Случайный/Внешний ШК: ${barcode}`, false, { barcode, isRealParcel: false });
+                        }
+                    });
+                }
             }
         }
 
         dbPut('scans_history', {
             barcode: barcode,
-            sessionId: activeSession ? activeSession.sessionId : null,
-            clientName: activeSession ? activeSession.clientName : null,
+            sessionId: activeId,
             operator: currentOp,
             time: now,
-            isAlien: activeSession ? !isMatchInCurrent : false
+            isAlien: activeId ? !isMatchInCurrent : false
         });
     }
 
@@ -430,11 +532,12 @@
         .bb-card-head { display: flex !important; justify-content: space-between !important; align-items: center !important; }
         .bb-card-name { font-weight: 700; font-size: 14px; color: #f8fafc; }
         .bb-card-time { font-size: 11px; color: #64748b; font-family: monospace; }
-        .bb-card-sub { font-size: 12px; color: #94a3b8; display: flex; gap: 8px; align-items: center; }
+        .bb-card-sub { font-size: 12px; color: #94a3b8; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 
-        .bb-tag { font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: 4px; }
+        .bb-tag { font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: 4px; white-space: nowrap; }
         .bb-tag-warn { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
         .bb-tag-repeat { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3); }
+        .bb-tag-parallel { background: rgba(168, 85, 247, 0.2); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3); }
 
         .bb-timeline-node {
             position: relative !important;
@@ -524,12 +627,6 @@
             const sessions = await dbGetAll('sessions');
             sessions.sort((a, b) => b.foundAt - a.foundAt);
 
-            const clientOccurrences = {};
-            sessions.forEach(s => {
-                const k = (s.clientName || '').toLowerCase().trim();
-                clientOccurrences[k] = (clientOccurrences[k] || 0) + 1;
-            });
-
             container.innerHTML = `
                 <input type="text" class="bb-input" id="bb-session-search" placeholder="Поиск по клиенту или штрихкоду...">
                 <div id="bb-sessions-list" style="display: flex; flex-direction: column; gap: 8px;"></div>
@@ -546,7 +643,7 @@
 
                 let lastDateHeader = '';
 
-                items.forEach(s => {
+                items.forEach((s, idx) => {
                     const dateHeader = formatDateDivider(s.foundAt);
                     if (dateHeader !== lastDateHeader) {
                         lastDateHeader = dateHeader;
@@ -556,8 +653,17 @@
                         listEl.appendChild(divEl);
                     }
 
-                    const hasAlien = s.alienScans && s.alienScans.length > 0;
-                    const isRepeat = clientOccurrences[(s.clientName || '').toLowerCase().trim()] > 1;
+                    const hasAlien = s.alienScans && s.alienScans.some(a => a.isRealParcel);
+                    
+                    const isRepeat = s.clientId && items.some((other, oIdx) => {
+                        return oIdx !== idx && other.clientId === s.clientId && Math.abs(s.foundAt - other.foundAt) < (24 * 3600 * 1000);
+                    });
+
+                    const isParallel = items.some((other, oIdx) => {
+                        if (oIdx === idx || !s.closedAt || !other.closedAt) return false;
+                        return (s.foundAt >= other.foundAt && s.foundAt <= other.closedAt) || (other.foundAt >= s.foundAt && other.foundAt <= s.closedAt);
+                    });
+
                     const date = new Date(s.foundAt);
                     const timeStr = `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
 
@@ -572,8 +678,9 @@
                             <span>📦 ${s.postings?.length || 0} тов.</span>
                             <span>Яч. ${s.shelves || '—'}</span>
                             <span>👤 ${s.operator || '—'}</span>
-                            ${hasAlien ? `<span class="bb-tag bb-tag-warn">⚠️ Чужой пик (${s.alienScans.length})</span>` : ''}
-                            ${isRepeat ? `<span class="bb-tag bb-tag-repeat">🔄 Повтор</span>` : ''}
+                            ${hasAlien ? `<span class="bb-tag bb-tag-warn">⚠️ Чужой пик</span>` : ''}
+                            ${isRepeat ? `<span class="bb-tag bb-tag-repeat">🔄 Повтор за 24ч</span>` : ''}
+                            ${isParallel ? `<span class="bb-tag bb-tag-parallel">⚡ Параллельно</span>` : ''}
                         </div>
                     `;
                     card.onclick = () => renderSessionReplay(s);
@@ -587,8 +694,10 @@
                 const query = e.target.value.toLowerCase().trim();
                 const filtered = sessions.filter(s => {
                     const matchName = (s.clientName || '').toLowerCase().includes(query);
+                    const matchId = (s.clientId || '').toLowerCase().includes(query);
+                    const matchCode = (s.pickupCode || '').toLowerCase().includes(query);
                     const matchBarcode = s.postings?.some(p => (p.barcode && p.barcode.toLowerCase().includes(query)) || p.allBarcodes?.some(b => b.includes(query)));
-                    return matchName || matchBarcode;
+                    return matchName || matchId || matchCode || matchBarcode;
                 });
                 populate(filtered);
             };
@@ -606,7 +715,7 @@
             const resEl = container.querySelector('#bb-lookup-results');
 
             input.oninput = async () => {
-                const val = input.value.trim().toLowerCase();
+                const val = translit(input.value.trim().toLowerCase());
                 if (val.length < 3) {
                     resEl.innerHTML = '';
                     return;
@@ -631,7 +740,6 @@
                                 <span class="bb-card-time">${time}</span>
                             </div>
                             <div class="bb-card-sub">
-                                <span>Сессия: <b>${m.clientName || 'Вне сессии'}</b></span>
                                 <span>Оператор: <b>${m.operator}</b></span>
                                 ${m.isAlien ? '<span class="bb-tag bb-tag-warn">⚠️ ПИКНУТ В ЧУЖОМ ЗАКАЗЕ</span>' : ''}
                             </div>
@@ -644,7 +752,7 @@
         if (tab === 'aliens') {
             sidebar.style.display = 'none';
             const sessions = await dbGetAll('sessions');
-            const alienSessions = sessions.filter(s => s.alienScans && s.alienScans.length > 0);
+            const alienSessions = sessions.filter(s => s.alienScans && s.alienScans.some(a => a.isRealParcel));
 
             if (alienSessions.length === 0) {
                 container.innerHTML = '<div style="color: #10b981; font-weight: bold; text-align: center; padding: 40px;">✅ Чужих сканов и аномалий не зафиксировано!</div>';
@@ -652,7 +760,7 @@
             }
 
             container.innerHTML = `
-                <div style="font-size: 13px; color: #ef4444; font-weight: bold; margin-bottom: 6px;">Реестр опасных сканов (товар не принадлежал клиенту на момент пика):</div>
+                <div style="font-size: 13px; color: #ef4444; font-weight: bold; margin-bottom: 6px;">Реестр опасных сканов (товар со склада не принадлежал клиенту на момент пика):</div>
                 <div style="display: flex; flex-direction: column; gap: 8px;">
                     ${alienSessions.map(s => `
                         <div class="bb-card has-alien">
@@ -664,7 +772,7 @@
                                 <span>Оператор: <b>${s.operator}</b></span>
                             </div>
                             <div style="margin-top: 6px; font-size: 12px; color: #f87171;">
-                                ${s.alienScans.map(a => `<div>• [${new Date(a.time).toLocaleTimeString()}] ${a.text}</div>`).join('')}
+                                ${s.alienScans.filter(a => a.isRealParcel).map(a => `<div>• [${new Date(a.time).toLocaleTimeString()}] ${a.text}</div>`).join('')}
                             </div>
                         </div>
                     `).join('')}
@@ -756,12 +864,12 @@
                 Реконструкция: ${session.clientName || 'Без имени'}
             </div>
             <div style="font-size: 11px; color: #94a3b8; display: flex; flex-direction: column; gap: 2px;">
-                <div>Штрихкод: <b>${session.pickupCode || '—'}</b></div>
+                <div>Штрихкод / ID: <b>${session.pickupCode || session.clientId || '—'}</b></div>
                 <div>Оператор: <b>${session.operator || '—'}</b> · Ячейки: <b>${session.shelves || '—'}</b></div>
                 <div>Длительность: <b>${session.durationSec} сек</b></div>
             </div>
 
-            <div style="font-size: 12px; font-weight: 700; margin-top: 10px; color: #38bdf8;">Товары заказа (${session.postings?.length || 0}):</div>
+            <div style="font-size: 12px; font-weight: 700; margin-top: 10px; color: #38bdf8;">Товары к выдаче (${session.postings?.length || 0}):</div>
             <div style="display: flex; flex-direction: column; gap: 4px;">
                 ${(session.postings || []).map(p => `
                     <div style="font-size: 11px; background: rgba(255,255,255,0.02); padding: 6px 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.05);">
