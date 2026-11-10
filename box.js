@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ozon BlackBox (Forensics & Audit Core)
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      2.1
 // @description  Ozon BlackBox
 // @author       desslow
 // @match        https://*.ozon.ru/*
@@ -26,9 +26,13 @@
     let externalDumpData = null;
     window._ozonAuthHeaders = null;
 
-    const TAB_ID = Math.random().toString(36).slice(2, 9);
-    const MONTHS_RU = ['янв.', 'фев.', 'мар.', 'апр.', 'мая', 'июн.', 'июл.', 'авг.', 'сен.', 'окт.', 'нояб.', 'дек.'];
+    // Трекер асинхронных тасок выдачи (giveout-v3 -> tasks-statuses)
+    // Structure: { [taskId]: { sessionId, postingId, isReturn, returnReasonId } }
+    const pendingGiveoutTasks = new Map();
+    // Хранилище данных последней операции giveout для сессии: { [sessionId]: { postingsMap: Map } }
+    const sessionGiveoutPayloads = new Map();
 
+    const TAB_ID = Math.random().toString(36).slice(2, 9);
     const RUS_TO_ENG = {
         'й':'q','ц':'w','у':'e','к':'r','е':'t','н':'y','г':'u','ш':'i','щ':'o','з':'p',
         'х':'[','ъ':']','ф':'a','ы':'s','в':'d','а':'f','п':'g','р':'h','о':'j','л':'k',
@@ -228,7 +232,9 @@
             if (clientName) session.clientName = clientName;
             if (shelves) session.shelves = shelves;
             if (currentCode) session.pickupCode = currentCode;
-            session.postings = readyPostings.map(extractPostingDetails);
+            if (!session.postings || session.postings.length === 0) {
+                session.postings = readyPostings.map(extractPostingDetails);
+            }
         }
 
         activeSession = session;
@@ -255,7 +261,7 @@
         const targetId = sId ? String(sId) : (activeSession ? activeSession.sessionId : getActiveSessionIdOnTab());
         if (!targetId) return;
 
-        const session = await dbGet('sessions', targetId);
+        const session = await dbGet('sessions', String(targetId));
         if (!session || session.closedAt) return;
 
         session.closedAt = Date.now();
@@ -267,24 +273,51 @@
         let annulatedCount = 0;
         let storageCount = 0;
 
+        // 1. Проверяем точные данные от giveout-v3 API
+        const apiGiveoutData = sessionGiveoutPayloads.get(String(targetId));
+
         session.postings.forEach(pObj => {
-            const cardWrapper = document.querySelector(`[data-testid="${pObj.id}"]`);
-            if (cardWrapper) {
-                const txt = cardWrapper.textContent;
-                if (txt.includes('К выдаче') && !txt.includes('К аннуляции') && !txt.includes('Отказ')) {
-                    pObj.status = 'issued';
-                    issuedCount++;
-                } else if (txt.includes('К аннуляции') || txt.includes('Отказ')) {
+            const pIdStr = String(pObj.id);
+            if (apiGiveoutData && apiGiveoutData.has(pIdStr)) {
+                const itemMeta = apiGiveoutData.get(pIdStr);
+                if (itemMeta.isReturn) {
                     pObj.status = 'annulated';
-                    const reasonBtn = Array.from(cardWrapper.querySelectorAll('button')).find(b => b.textContent.includes('К аннуляции'));
-                    pObj.reasonText = reasonBtn ? reasonBtn.textContent.replace('К аннуляции:', '').trim() : 'Отказ';
+                    pObj.reasonText = itemMeta.reasonId ? `Причина #${itemMeta.reasonId}` : 'Отказ клиента';
                     annulatedCount++;
                 } else {
-                    pObj.status = 'storage';
-                    storageCount++;
+                    pObj.status = 'issued';
+                    issuedCount++;
                 }
             } else {
-                storageCount++;
+                // Фоллбэк на DOM-анализ, если закрыто вручную без вызова giveout-v3
+                const cardWrapper = document.querySelector(`[data-testid="${pObj.id}"]`);
+                if (cardWrapper) {
+                    const txt = cardWrapper.textContent;
+                    if (txt.includes('К выдаче') && !txt.includes('К аннуляции') && !txt.includes('Отказ')) {
+                        pObj.status = 'issued';
+                        issuedCount++;
+                    } else if (txt.includes('К аннуляции') || txt.includes('Отказ')) {
+                        pObj.status = 'annulated';
+                        const reasonBtn = Array.from(cardWrapper.querySelectorAll('button')).find(b => b.textContent.includes('К аннуляции'));
+                        pObj.reasonText = reasonBtn ? reasonBtn.textContent.replace('К аннуляции:', '').trim() : 'Отказ';
+                        annulatedCount++;
+                    } else {
+                        pObj.status = 'storage';
+                        storageCount++;
+                    }
+                } else {
+                    // Если была обычная успешная выдача giveout-v3, но часть товаров осталась
+                    if (reason === 'completed' && apiGiveoutData) {
+                        pObj.status = 'storage';
+                        storageCount++;
+                    } else if (reason === 'completed') {
+                        pObj.status = 'issued';
+                        issuedCount++;
+                    } else {
+                        pObj.status = 'storage';
+                        storageCount++;
+                    }
+                }
             }
         });
 
@@ -299,6 +332,8 @@
         session.timeline.push({ time: Date.now(), type: 'finish', text: summaryText });
 
         await dbPut('sessions', session);
+        sessionGiveoutPayloads.delete(String(targetId));
+
         if (activeSession && String(activeSession.sessionId) === String(targetId)) {
             activeSession = null;
         }
@@ -340,33 +375,106 @@
         } catch (e) {}
     }
 
-    function interceptPayload(url, data, status = 200) {
+    // Обработчик сетевых перехватов
+    function interceptPayload(url, reqBody, resData, status = 200) {
+        // 1. Старый эндпоинт закрытия сессии (для обратной совместимости)
         if (url.includes('/api2/giveout/Sessions/close')) {
             let closedId = null;
-            if (typeof data === 'string') {
-                try { closedId = JSON.parse(data).sessionId; } catch (e) {}
-            } else if (data && data.sessionId) {
-                closedId = data.sessionId;
+            if (typeof reqBody === 'string') {
+                try { closedId = JSON.parse(reqBody).sessionId; } catch (e) {}
+            } else if (reqBody && reqBody.sessionId) {
+                closedId = reqBody.sessionId;
             }
             finalizeActiveSession(closedId, 'completed');
         }
 
+        // 2. Новый эндпоинт выдачи: /api2/giveout/Postings/giveout-v3
+        if (url.includes('/api2/giveout/Postings/giveout-v3')) {
+            try {
+                const parsedReq = typeof reqBody === 'string' ? JSON.parse(reqBody) : reqBody;
+                const parsedRes = typeof resData === 'string' ? JSON.parse(resData) : resData;
+
+                if (parsedReq && parsedReq.sessionId) {
+                    const sId = String(parsedReq.sessionId);
+                    const postingsMap = new Map();
+
+                    (parsedReq.postings || []).forEach(p => {
+                        const isReturn = Boolean(p.returnReasonId !== null && p.returnReasonId !== undefined) || (p.returnExemplars && p.returnExemplars.length > 0);
+                        postingsMap.set(String(p.id), {
+                            isReturn,
+                            reasonId: p.returnReasonId
+                        });
+                    });
+
+                    sessionGiveoutPayloads.set(sId, postingsMap);
+
+                    // Регистрируем созданные асинхронные таски
+                    if (parsedRes && Array.isArray(parsedRes.tasks)) {
+                        parsedRes.tasks.forEach(t => {
+                            pendingGiveoutTasks.set(String(t.taskId), {
+                                sessionId: sId,
+                                postingIds: t.postingIds
+                            });
+                        });
+                    } else {
+                        // Если тасок нет в ответе, закрываем сразу
+                        finalizeActiveSession(sId, 'completed');
+                    }
+                }
+            } catch (e) {}
+        }
+
+        // 3. Поллинг статусов фоновых задач выдачи: giveout-v2-tasks-statuses
+        if (url.includes('/api2/giveout/Postings/giveout-v2-tasks-statuses')) {
+            try {
+                const parsedRes = typeof resData === 'string' ? JSON.parse(resData) : resData;
+                if (parsedRes && Array.isArray(parsedRes.statuses)) {
+                    parsedRes.statuses.forEach(st => {
+                        const tId = String(st.id);
+                        if (st.status === 'Processed' && pendingGiveoutTasks.has(tId)) {
+                            const taskInfo = pendingGiveoutTasks.get(tId);
+                            pendingGiveoutTasks.delete(tId);
+
+                            // Проверяем: остались ли еще активные таски у этой сессии?
+                            let hasActiveTasksForSession = false;
+                            for (let entry of pendingGiveoutTasks.values()) {
+                                if (entry.sessionId === taskInfo.sessionId) {
+                                    hasActiveTasksForSession = true;
+                                    break;
+                                }
+                            }
+
+                            // Все таски выдачи выполнены — закрываем сессию официально!
+                            if (!hasActiveTasksForSession) {
+                                finalizeActiveSession(taskInfo.sessionId, 'completed');
+                            }
+                        }
+                    });
+                }
+            } catch (e) {}
+        }
+
+        // 4. Загрузка списка товаров сессии
         if (url.includes('/api2/giveout/Postings?sessionId=')) {
             const match = url.match(/sessionId=(\d+)/);
-            if (match && data) {
-                handleSessionPostingsData(match[1], data);
+            if (match && resData) {
+                const parsed = typeof resData === 'string' ? JSON.parse(resData) : resData;
+                handleSessionPostingsData(match[1], parsed);
             }
         }
 
+        // 5. Ошибки оплаты
         if (url.includes('/api2/giveout/Payment') || url.includes('/api2/giveout/Sessions/pay')) {
             if (status >= 400) {
                 recordTimelineEvent(null, 'payment_failed', '❌ ОШИБКА ПРОВЕДЕНИЯ ОПЛАТЫ', true);
             }
         }
 
+        // 6. Получение списка сессий
         if (url.includes('/api2/giveout/Sessions') && !url.includes('/close')) {
-            if (data && Array.isArray(data.sessions)) {
-                data.sessions.forEach(s => {
+            const parsed = typeof resData === 'string' ? JSON.parse(resData) : resData;
+            if (parsed && Array.isArray(parsed.sessions)) {
+                parsed.sessions.forEach(s => {
                     if (s.sessionId && s.clientId) {
                         sessionStorage.setItem('client_id_' + s.sessionId, String(s.clientId));
                     }
@@ -390,24 +498,12 @@
         return origSetRequestHeader.apply(this, arguments);
     };
 
-    XMLHttpRequest.prototype.send = function() {
+    XMLHttpRequest.prototype.send = function(body) {
         if (this._bHeaders) captureAuthToken(this._bHeaders);
-        const body = arguments[0];
         const self = this;
         this.addEventListener('load', function() {
             try {
-                if (self._bUrl.includes('/api2/giveout/Sessions/close')) {
-                    interceptPayload(self._bUrl, body, self.status);
-                }
-                if (self._bUrl.includes('/api2/giveout/Postings?sessionId=')) {
-                    interceptPayload(self._bUrl, JSON.parse(self.responseText), self.status);
-                }
-                if (self._bUrl.includes('/api2/giveout/Sessions')) {
-                    interceptPayload(self._bUrl, JSON.parse(self.responseText), self.status);
-                }
-                if (self._bUrl.includes('/Payment') || self._bUrl.includes('/pay')) {
-                    interceptPayload(self._bUrl, null, self.status);
-                }
+                interceptPayload(self._bUrl, body, self.responseText, self.status);
             } catch (e) {}
         });
         return origSend.apply(this, arguments);
@@ -426,18 +522,10 @@
         const response = await origFetch.apply(this, args);
 
         try {
-            if (url.includes('/api2/giveout/Sessions/close')) {
-                interceptPayload(url, args[1]?.body, response.status);
-            }
-            if (url.includes('/api2/giveout/Postings?sessionId=')) {
-                response.clone().json().then(data => interceptPayload(url, data, response.status)).catch(() => {});
-            }
-            if (url.includes('/api2/giveout/Sessions')) {
-                response.clone().json().then(data => interceptPayload(url, data, response.status)).catch(() => {});
-            }
-            if (url.includes('/Payment') || url.includes('/pay')) {
-                interceptPayload(url, null, response.status);
-            }
+            const reqBody = args[1]?.body;
+            response.clone().text().then(resText => {
+                interceptPayload(url, reqBody, resText, response.status);
+            }).catch(() => {});
         } catch (e) {}
 
         return response;
