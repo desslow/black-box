@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ozon BlackBox (Forensics & Audit Core)
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  Ozon BlackBox
 // @author       desslow
 // @match        https://*.ozon.ru/*
@@ -85,40 +85,30 @@
         return currentOperator;
     }
 
-    const origOpen = XMLHttpRequest.prototype.open;
-    const origSend = XMLHttpRequest.prototype.send;
+    function extractPostingDetails(p) {
+        const title = p.displayName || p.items?.[0]?.name || p.name || 'Товар';
+        let bar = p.displayBarcode1 || '';
+        if (!bar && Array.isArray(p.barcodes) && p.barcodes.length > 0) {
+            bar = p.barcodes.find(b => !b.startsWith('%')) || p.barcodes[0];
+        }
+        if (!bar && p.items?.[0]?.exemplars?.[0]?.barcodes?.[0]) {
+            bar = p.items[0].exemplars[0].barcodes[0];
+        }
+        if (!bar) bar = String(p.id);
 
-    XMLHttpRequest.prototype.open = function(method, url) {
-        this._bUrl = typeof url === 'string' ? url : '';
-        return origOpen.apply(this, arguments);
-    };
-
-    XMLHttpRequest.prototype.send = function() {
-        const body = arguments[0];
-        this.addEventListener('load', function() {
-            try {
-                if (this._bUrl.includes('/api2/giveout/Sessions/close')) {
-                    let closedId = null;
-                    if (typeof body === 'string') {
-                        try { closedId = JSON.parse(body).sessionId; } catch (e) {}
-                    }
-                    finalizeActiveSession(closedId);
-                }
-
-                if (this._bUrl.includes('/api2/giveout/Postings?sessionId=')) {
-                    const match = this._bUrl.match(/sessionId=(\d+)/);
-                    if (match) {
-                        const sId = match[1];
-                        const data = JSON.parse(this.responseText);
-                        handleSessionPostingsData(sId, data);
-                    }
-                }
-            } catch (e) {}
-        });
-        return origSend.apply(this, arguments);
-    };
+        return {
+            id: String(p.id),
+            name: title,
+            barcode: bar,
+            allBarcodes: (p.barcodes || []).map(b => String(b).toLowerCase()),
+            price: p.price || 0,
+            status: 'storage',
+            reasonText: ''
+        };
+    }
 
     function handleSessionPostingsData(sessionId, data) {
+        if (!data || !data.postings) return;
         const sId = String(sessionId);
         currentPostingsList = Array.isArray(data.postings) ? data.postings : [];
 
@@ -137,16 +127,7 @@
                 durationSec: 0,
                 operator: getOperatorLogin(),
                 shelves: shelves,
-                postings: currentPostingsList.map(p => ({
-                    id: p.id,
-                    name: p.name || p.displayName,
-                    barcode: p.barcode,
-                    allBarcodes: p.barcodes || [],
-                    price: p.price,
-                    clientAmount: p.clientAmount,
-                    status: 'storage',
-                    reasonText: ''
-                })),
+                postings: currentPostingsList.map(extractPostingDetails),
                 timeline: [
                     { time: Date.now(), type: 'start', text: 'Сессия открыта' }
                 ],
@@ -154,7 +135,8 @@
             };
         } else {
             activeSession.shelves = shelves;
-            activeSession.clientName = clientName || activeSession.clientName;
+            if (clientName) activeSession.clientName = clientName;
+            activeSession.postings = currentPostingsList.map(extractPostingDetails);
         }
     }
 
@@ -175,19 +157,15 @@
         activeSession.durationSec = Math.max(1, Math.round((activeSession.closedAt - activeSession.foundAt) / 1000));
         activeSession.operator = getOperatorLogin() || activeSession.operator;
 
-        const cards = Array.from(document.querySelectorAll('[data-testid="postingContentWrapper"]')).map(w => w.closest('[class*="_card_"]')).filter(Boolean);
-        cards.forEach(c => {
-            const txt = c.textContent;
-            const barcodeMatch = txt.match(/ii\d+/i);
-            const foundBarcode = barcodeMatch ? barcodeMatch[0].toLowerCase() : '';
-
-            const pObj = activeSession.postings.find(p => p.barcode && p.barcode.toLowerCase() === foundBarcode);
-            if (pObj) {
+        activeSession.postings.forEach(pObj => {
+            const cardWrapper = document.querySelector(`[data-testid="${pObj.id}"]`);
+            if (cardWrapper) {
+                const txt = cardWrapper.textContent;
                 if (txt.includes('К выдаче') && !txt.includes('К аннуляции') && !txt.includes('Отказ')) {
                     pObj.status = 'issued';
                 } else if (txt.includes('К аннуляции') || txt.includes('Отказ')) {
                     pObj.status = 'annulated';
-                    const reasonBtn = Array.from(c.querySelectorAll('button')).find(b => b.textContent.includes('К аннуляции'));
+                    const reasonBtn = Array.from(cardWrapper.querySelectorAll('button')).find(b => b.textContent.includes('К аннуляции'));
                     pObj.reasonText = reasonBtn ? reasonBtn.textContent.replace('К аннуляции:', '').trim() : 'Отказ';
                 } else {
                     pObj.status = 'storage';
@@ -201,6 +179,65 @@
         activeSession = null;
         currentPostingsList = [];
     }
+
+    function interceptPayload(url, data) {
+        if (url.includes('/api2/giveout/Sessions/close')) {
+            let closedId = null;
+            if (typeof data === 'string') {
+                try { closedId = JSON.parse(data).sessionId; } catch (e) {}
+            } else if (data && data.sessionId) {
+                closedId = data.sessionId;
+            }
+            finalizeActiveSession(closedId);
+        }
+
+        if (url.includes('/api2/giveout/Postings?sessionId=')) {
+            const match = url.match(/sessionId=(\d+)/);
+            if (match && data) {
+                handleSessionPostingsData(match[1], data);
+            }
+        }
+    }
+
+    const origOpen = XMLHttpRequest.prototype.open;
+    const origSend = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function(method, url) {
+        this._bUrl = typeof url === 'string' ? url : '';
+        return origOpen.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.send = function() {
+        const body = arguments[0];
+        this.addEventListener('load', function() {
+            try {
+                if (this._bUrl.includes('/api2/giveout/Sessions/close')) {
+                    interceptPayload(this._bUrl, body);
+                }
+                if (this._bUrl.includes('/api2/giveout/Postings?sessionId=')) {
+                    interceptPayload(this._bUrl, JSON.parse(this.responseText));
+                }
+            } catch (e) {}
+        });
+        return origSend.apply(this, arguments);
+    };
+
+    const origFetch = window.fetch;
+    window.fetch = async function(...args) {
+        const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+        const response = await origFetch.apply(this, args);
+
+        try {
+            if (url.includes('/api2/giveout/Sessions/close')) {
+                interceptPayload(url, args[1]?.body);
+            }
+            if (url.includes('/api2/giveout/Postings?sessionId=')) {
+                response.clone().json().then(data => interceptPayload(url, data)).catch(() => {});
+            }
+        } catch (e) {}
+
+        return response;
+    };
 
     window.addEventListener('keydown', function(e) {
         if (e.ctrlKey && e.shiftKey && e.altKey && e.code === 'KeyB') {
@@ -221,7 +258,7 @@
         }
 
         const now = Date.now();
-        if (now - lastScanTime > 80) scanBuffer = '';
+        if (now - lastScanTime > 150) scanBuffer = '';
         lastScanTime = now;
 
         if (e.key === 'Enter') {
@@ -250,16 +287,16 @@
 
         if (activeSession && currentPostingsList.length > 0) {
             isMatchInCurrent = currentPostingsList.some(p => {
-                const pBar = (p.barcode || '').toLowerCase();
-                const pId = String(p.id || '').toLowerCase();
-                const bList = (p.barcodes || []).map(b => b.toLowerCase());
-                return pBar.includes(clean) || clean.includes(pBar) || pId.includes(clean) || bList.some(b => b.includes(clean));
+                const pId = String(p.id).toLowerCase();
+                const pBar = (p.displayBarcode1 || '').toLowerCase();
+                const bList = (p.barcodes || []).map(b => String(b).toLowerCase());
+                return pId.includes(clean) || clean.includes(pId) || pBar.includes(clean) || clean.includes(pBar) || bList.some(b => b.includes(clean));
             });
 
             if (isMatchInCurrent) {
                 recordTimelineEvent('scan', `Отсканирован товар: ${barcode}`, false, { barcode });
             } else {
-                recordTimelineEvent('alien_scan', `⚠️ ЧУЖОЙ ПИК: ${barcode} (не принадлежит заказу)`, true, { barcode });
+                recordTimelineEvent('alien_scan', `⚠️ ЧУЖОЙ ПИК: ${barcode}`, true, { barcode });
             }
         }
 
@@ -290,9 +327,9 @@
         }
 
         .bb-window {
-            width: 900px !important;
+            width: 960px !important;
             max-width: 95vw !important;
-            height: 720px !important;
+            height: 740px !important;
             max-height: 90vh !important;
             background: #0f172a !important;
             border: 1px solid rgba(255, 255, 255, 0.12) !important;
@@ -320,14 +357,9 @@
             align-items: center !important;
             gap: 8px !important;
         }
-        .bb-title span {
-            color: #38bdf8 !important;
-        }
+        .bb-title span { color: #38bdf8 !important; }
 
-        .bb-tabs {
-            display: flex !important;
-            gap: 6px !important;
-        }
+        .bb-tabs { display: flex !important; gap: 6px !important; }
         .bb-tab-btn {
             background: transparent !important;
             border: 1px solid transparent !important;
@@ -339,50 +371,19 @@
             cursor: pointer !important;
             transition: all 0.15s !important;
         }
-        .bb-tab-btn:hover {
-            color: #fff !important;
-            background: rgba(255, 255, 255, 0.05) !important;
-        }
+        .bb-tab-btn:hover { color: #fff !important; background: rgba(255, 255, 255, 0.05) !important; }
         .bb-tab-btn.active {
             color: #38bdf8 !important;
             background: rgba(56, 189, 248, 0.12) !important;
             border-color: rgba(56, 189, 248, 0.3) !important;
         }
 
-        .bb-close {
-            color: #64748b !important;
-            cursor: pointer !important;
-            font-size: 18px !important;
-            padding: 2px 6px !important;
-        }
+        .bb-close { color: #64748b !important; cursor: pointer !important; font-size: 18px !important; padding: 2px 6px !important; }
         .bb-close:hover { color: #fff !important; }
 
-        .bb-body {
-            flex: 1 1 auto !important;
-            display: flex !important;
-            overflow: hidden !important;
-        }
-
-        .bb-main-view {
-            flex: 1 1 auto !important;
-            padding: 16px !important;
-            overflow-y: auto !important;
-            display: flex !important;
-            flex-direction: column !important;
-            gap: 10px !important;
-        }
-
-        .bb-replay-view {
-            width: 380px !important;
-            min-width: 380px !important;
-            border-left: 1px solid rgba(255, 255, 255, 0.08) !important;
-            background: #090d16 !important;
-            padding: 16px !important;
-            display: flex !important;
-            flex-direction: column !important;
-            gap: 10px !important;
-            overflow-y: auto !important;
-        }
+        .bb-body { flex: 1 1 auto !important; display: flex !important; overflow: hidden !important; }
+        .bb-main-view { flex: 1 1 auto !important; padding: 16px !important; overflow-y: auto !important; display: flex !important; flex-direction: column !important; gap: 10px !important; }
+        .bb-replay-view { width: 420px !important; min-width: 420px !important; border-left: 1px solid rgba(255, 255, 255, 0.08) !important; background: #090d16 !important; padding: 16px !important; display: flex !important; flex-direction: column !important; gap: 10px !important; overflow-y: auto !important; }
 
         .bb-input {
             background: rgba(255, 255, 255, 0.05) !important;
@@ -396,6 +397,18 @@
             box-sizing: border-box !important;
         }
         .bb-input:focus { border-color: #38bdf8 !important; }
+
+        .bb-date-divider {
+            font-size: 11px !important;
+            font-weight: 800 !important;
+            text-transform: uppercase !important;
+            letter-spacing: 0.6px !important;
+            color: #38bdf8 !important;
+            background: rgba(56, 189, 248, 0.08) !important;
+            padding: 4px 10px !important;
+            border-radius: 6px !important;
+            margin-top: 6px !important;
+        }
 
         .bb-card {
             background: rgba(255, 255, 255, 0.03) !important;
@@ -412,22 +425,14 @@
             background: rgba(255, 255, 255, 0.06) !important;
             border-color: rgba(255, 255, 255, 0.15) !important;
         }
-        .bb-card.has-alien {
-            border-left: 3px solid #ef4444 !important;
-        }
+        .bb-card.has-alien { border-left: 3px solid #ef4444 !important; }
 
-        .bb-card-head {
-            display: flex !important;
-            justify-content: space-between !important;
-            align-items: center !important;
-        }
+        .bb-card-head { display: flex !important; justify-content: space-between !important; align-items: center !important; }
         .bb-card-name { font-weight: 700; font-size: 14px; color: #f8fafc; }
         .bb-card-time { font-size: 11px; color: #64748b; font-family: monospace; }
         .bb-card-sub { font-size: 12px; color: #94a3b8; display: flex; gap: 8px; align-items: center; }
 
-        .bb-tag {
-            font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: 4px;
-        }
+        .bb-tag { font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: 4px; }
         .bb-tag-warn { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
         .bb-tag-repeat { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3); }
 
@@ -496,6 +501,19 @@
         renderTabContent('sessions');
     }
 
+    function formatDateDivider(timestamp) {
+        const d = new Date(timestamp);
+        const now = new Date();
+        const isToday = d.toDateString() === now.toDateString();
+        const yesterday = new Date(now);
+        yesterday.setDate(now.getDate() - 1);
+        const isYesterday = d.toDateString() === yesterday.toDateString();
+
+        if (isToday) return 'Сегодня';
+        if (isYesterday) return 'Вчера';
+        return d.toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' });
+    }
+
     async function renderTabContent(tab) {
         const container = document.getElementById('bb-main-content');
         const sidebar = document.getElementById('bb-replay-sidebar');
@@ -525,7 +543,19 @@
                     listEl.innerHTML = '<div style="color: #64748b; text-align: center; padding: 20px;">Нет данных</div>';
                     return;
                 }
+
+                let lastDateHeader = '';
+
                 items.forEach(s => {
+                    const dateHeader = formatDateDivider(s.foundAt);
+                    if (dateHeader !== lastDateHeader) {
+                        lastDateHeader = dateHeader;
+                        const divEl = document.createElement('div');
+                        divEl.className = 'bb-date-divider';
+                        divEl.textContent = dateHeader;
+                        listEl.appendChild(divEl);
+                    }
+
                     const hasAlien = s.alienScans && s.alienScans.length > 0;
                     const isRepeat = clientOccurrences[(s.clientName || '').toLowerCase().trim()] > 1;
                     const date = new Date(s.foundAt);
@@ -535,13 +565,13 @@
                     card.className = `bb-card ${hasAlien ? 'has-alien' : ''}`;
                     card.innerHTML = `
                         <div class="bb-card-head">
-                            <span class="bb-card-name">${s.clientName}</span>
+                            <span class="bb-card-name">${s.clientName || 'Без имени'}</span>
                             <span class="bb-card-time">${timeStr} (${s.durationSec}с)</span>
                         </div>
                         <div class="bb-card-sub">
                             <span>📦 ${s.postings?.length || 0} тов.</span>
                             <span>Яч. ${s.shelves || '—'}</span>
-                            <span>👤 ${s.operator}</span>
+                            <span>👤 ${s.operator || '—'}</span>
                             ${hasAlien ? `<span class="bb-tag bb-tag-warn">⚠️ Чужой пик (${s.alienScans.length})</span>` : ''}
                             ${isRepeat ? `<span class="bb-tag bb-tag-repeat">🔄 Повтор</span>` : ''}
                         </div>
@@ -556,8 +586,8 @@
             container.querySelector('#bb-session-search').oninput = (e) => {
                 const query = e.target.value.toLowerCase().trim();
                 const filtered = sessions.filter(s => {
-                    const matchName = s.clientName.toLowerCase().includes(query);
-                    const matchBarcode = s.postings?.some(p => p.barcode?.toLowerCase().includes(query));
+                    const matchName = (s.clientName || '').toLowerCase().includes(query);
+                    const matchBarcode = s.postings?.some(p => (p.barcode && p.barcode.toLowerCase().includes(query)) || p.allBarcodes?.some(b => b.includes(query)));
                     return matchName || matchBarcode;
                 });
                 populate(filtered);
@@ -723,20 +753,25 @@
 
         sidebar.innerHTML = `
             <div style="font-weight: 800; font-size: 14px; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 6px;">
-                Реконструкция: ${session.clientName}
+                Реконструкция: ${session.clientName || 'Без имени'}
             </div>
             <div style="font-size: 11px; color: #94a3b8; display: flex; flex-direction: column; gap: 2px;">
                 <div>Штрихкод: <b>${session.pickupCode || '—'}</b></div>
-                <div>Оператор: <b>${session.operator}</b> · Ячейки: <b>${session.shelves || '—'}</b></div>
+                <div>Оператор: <b>${session.operator || '—'}</b> · Ячейки: <b>${session.shelves || '—'}</b></div>
                 <div>Длительность: <b>${session.durationSec} сек</b></div>
             </div>
 
             <div style="font-size: 12px; font-weight: 700; margin-top: 10px; color: #38bdf8;">Товары заказа (${session.postings?.length || 0}):</div>
             <div style="display: flex; flex-direction: column; gap: 4px;">
                 ${(session.postings || []).map(p => `
-                    <div style="font-size: 11px; background: rgba(255,255,255,0.02); padding: 4px 6px; border-radius: 4px;">
-                        <div style="font-weight: 600;">${p.name}</div>
-                        <div style="color: #64748b;">${p.barcode} · ${p.price} ₽ · <span style="color: ${p.status === 'issued' ? '#10b981' : (p.status === 'annulated' ? '#ef4444' : '#94a3b8')}">${p.status === 'issued' ? 'Выдан' : (p.status === 'annulated' ? 'Отказ (' + p.reasonText + ')' : 'На хранении')}</span></div>
+                    <div style="font-size: 11px; background: rgba(255,255,255,0.02); padding: 6px 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.05);">
+                        <div style="font-weight: 600; color: #f8fafc;">${p.name}</div>
+                        <div style="color: #64748b; margin-top: 2px;">
+                            ${p.barcode} · ${p.price} ₽ · 
+                            <span style="font-weight: 700; color: ${p.status === 'issued' ? '#10b981' : (p.status === 'annulated' ? '#ef4444' : '#94a3b8')}">
+                                ${p.status === 'issued' ? 'Выдан' : (p.status === 'annulated' ? 'Отказ (' + p.reasonText + ')' : 'На хранении')}
+                            </span>
+                        </div>
                     </div>
                 `).join('')}
             </div>
