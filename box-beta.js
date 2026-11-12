@@ -392,13 +392,25 @@
         if (!bar && p.items?.[0]?.exemplars?.[0]?.barcodes?.[0]) bar = p.items[0].exemplars[0].barcodes[0];
         if (!bar) bar = String(p.id);
 
+        // Индивидуальная ячейка конкретного отправления
+        let specificShelf = p.shelfAddress || p.address || '';
+        if (!specificShelf && Array.isArray(p.postingShelves) && p.postingShelves.length > 0) {
+            specificShelf = p.postingShelves.join(', ');
+        }
+        if (!specificShelf) specificShelf = 'Основная';
+
         return {
             id: String(p.id),
             name: title,
             barcode: bar,
+            shelf: specificShelf, // ТОЧНАЯ ЯЧЕЙКА ЭТОГО ТОВАРА
             allBarcodes: (p.barcodes || []).map(b => String(b).toLowerCase()),
             price: p.price || 0,
             status: 'storage',
+            isScanned: false,         // Был ли реальный скан?
+            scannedAt: null,          // Точный timestamp
+            scannedTimeFormatted: '', // Время вида 14:28:05
+            scannedBy: '',            // Кто именно пикнул
             reasonText: '',
             inbound: null
         };
@@ -784,12 +796,41 @@
             if (session) {
                 currentClientName = session.clientName || 'Без имени';
                 if (session.postings) {
-                    isMatchInCurrent = session.postings.some(p => {
+                    const targetPosting = session.postings.find(p => {
                         const pId = String(p.id).toLowerCase();
                         const pBar = (p.barcode || '').toLowerCase();
                         const bList = (p.allBarcodes || []).map(b => String(b).toLowerCase());
                         return pId.includes(clean) || clean.includes(pId) || pBar.includes(clean) || clean.includes(pBar) || bList.some(b => b.includes(clean));
                     });
+
+                    if (targetPosting) {
+                        isMatchInCurrent = true;
+                        const nowTs = Date.now();
+                        const timeStr = new Date(nowTs).toLocaleTimeString('ru-RU');
+
+                        // Фиксируем физический скан намертво в объекте товара
+                        targetPosting.isScanned = true;
+                        targetPosting.scannedAt = nowTs;
+                        targetPosting.scannedTimeFormatted = timeStr;
+                        targetPosting.scannedBy = currentOp;
+
+                        recordTimelineEvent(activeId, 'scan', `Отсканирован товар: ${targetPosting.name} [Яч. ${targetPosting.shelf}] оператором ${currentOp} в ${timeStr}`, false, { 
+                            barcode, 
+                            postingId: targetPosting.id,
+                            shelf: targetPosting.shelf,
+                            operator: currentOp,
+                            exactTime: nowTs
+                        });
+
+                        // Сохраняем сессию с обновленными данными товара
+                        await dbPut('sessions', session);
+                        cloudSyncSession(session);
+                    } else {
+                        verifyOzonArticle(barcode).then(res => {
+                            if (res.isOzonArticle) recordTimelineEvent(activeId, 'alien_scan', `⚠️ ЧУЖОЙ ТОВАР СО СКЛАДА: ${barcode} (${res.name})`, true, { barcode, isRealParcel: true, operator: currentOp });
+                            else recordTimelineEvent(activeId, 'junk_scan', `ℹ️ Служебный/Внешний ШК: ${barcode}`, false, { barcode, isRealParcel: false, operator: currentOp });
+                        });
+                    }
                 }
             }
         }
@@ -1505,21 +1546,35 @@
             <div style="display: flex; flex-direction: column; gap: 6px;" id="bb-postings-list-wrap">
                 ${(session.postings || []).map(p => {
                     const ib = p.inbound;
+                    const scanStatusHtml = p.isScanned 
+                        ? `<span style="color: #34d399; font-weight: 700;">✓ Пикнут в ${p.scannedTimeFormatted} (${p.scannedBy})</span>`
+                        : `<span style="color: #f59e0b; font-weight: 600;">⚠ Не сканировался (выдан кликом)</span>`;
+
                     return `
                         <div style="font-size: 11px; background: rgba(255,255,255,0.02); padding: 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.05);" data-posting-card-id="${p.id}">
-                            <div style="font-weight: 600; color: #f8fafc;">${p.name}</div>
-                            <div style="color: #64748b; margin-top: 2px;">
-                                ${p.barcode} · ${p.price} ₽ ·
+                            <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 6px;">
+                                <div style="font-weight: 600; color: #f8fafc;">${p.name}</div>
+                                <span style="background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); padding: 1px 6px; border-radius: 4px; font-weight: 700; white-space: nowrap; font-size: 10px;">
+                                    Яч. ${p.shelf || '—'}
+                                </span>
+                            </div>
+                            <div style="color: #64748b; margin-top: 3px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                                <span>${p.barcode}</span> · 
+                                <span>${p.price} ₽</span> · 
                                 <span style="font-weight: 700; color: ${p.status === 'issued' ? '#10b981' : (p.status === 'annulated' ? '#ef4444' : '#94a3b8')}">
                                     ${p.status === 'issued' ? 'Выдан' : (p.status === 'annulated' ? 'Отказ (' + p.reasonText + ')' : 'На хранении')}
                                 </span>
                             </div>
-                            <div class="bb-inbound-slot">
-                                ${ib ? `
-                                    <div class="bb-posting-placement-badge">
-                                        📥 <b>${ib.text}</b> · ${ib.time} · <span style="opacity:0.7">${ib.operator}</span>
-                                    </div>
-                                ` : `<div style="font-size: 10px; color: #475569; margin-top: 4px;">История приемки синхронизируется...</div>`}
+                            <!-- СТАТУС СКАНА И ПРИЕМКИ -->
+                            <div style="margin-top: 5px; display: flex; flex-direction: column; gap: 3px; font-size: 10px;">
+                                <div>${scanStatusHtml}</div>
+                                <div class="bb-inbound-slot">
+                                    ${ib ? `
+                                        <div class="bb-posting-placement-badge">
+                                            📥 <b>${ib.text}</b> · ${ib.time} · <span style="opacity:0.7">${ib.operator}</span>
+                                        </div>
+                                    ` : `<div style="color: #475569;">История приемки синхронизируется...</div>`}
+                                </div>
                             </div>
                         </div>
                     `;
