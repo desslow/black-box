@@ -563,8 +563,31 @@
         if (clientId) sessionStorage.setItem('client_id_' + sId, String(clientId));
 
         let session = await dbGet('sessions', sId);
-        let realCode = sessionStorage.getItem('client_code_' + sId) || (session && session.pickupCode && !session.pickupCode.includes('----') ? session.pickupCode : '');
+
+        // 1. Ищем настоящий код в sessionStorage, памяти сессии или кэше
+        let realCode = sessionStorage.getItem('client_code_' + sId) || 
+                       sessionStorage.getItem('client_code_pending');
+
+        // Если в сохраненной сессии уже был валидный код без дефисов — НИКОГДА его не затираем
+        if (!realCode && session && session.pickupCode && !session.pickupCode.includes('----')) {
+            realCode = session.pickupCode;
+        }
+
+        // Если кода все еще нет, проверяем по общему clientId
+        if (!realCode && clientId) {
+            const cachedByCid = sessionStorage.getItem('client_code_cid_' + clientId);
+            if (cachedByCid) realCode = cachedByCid;
+        }
+
+        // И только если кода ВООБЩЕ нигде нет в природе — ставим заглушку
         const currentCode = realCode || (clientId ? `${clientId}*----` : '');
+
+        if (realCode && !realCode.includes('----')) {
+            sessionStorage.setItem('client_code_' + sId, realCode);
+            if (clientId) sessionStorage.setItem('client_code_cid_' + clientId, realCode);
+            sessionStorage.removeItem('client_code_pending');
+        }
+
         const apiOperator = sessionStorage.getItem('session_operator_' + sId) || '';
 
         const postingsList = readyPostings.map(extractPostingDetails);
@@ -596,16 +619,71 @@
         const targetId = sId ? String(sId) : (activeSession ? activeSession.sessionId : getActiveSessionIdOnTab());
         if (!targetId) return;
 
-        const session = await dbGet('sessions', String(targetId));
-        if (!session || session.closedAt) return;
+        let session = await dbGet('sessions', String(targetId));
+        if (!session) return;
+
+        // Если сессия уже закрыта официально и имеет статус не active — не дублируем
+        if (session.closedAt && session.closeReason !== 'active') return;
 
         session.closedAt = Date.now();
         session.durationSec = Math.max(1, Math.round((session.closedAt - session.foundAt) / 1000));
         session.closeReason = reason;
 
+        const apiOperator = sessionStorage.getItem('session_operator_' + targetId);
+        if (apiOperator) session.operator = apiOperator;
+
+        let issuedCount = 0, annulatedCount = 0, storageCount = 0;
+        const apiGiveoutData = sessionGiveoutPayloads.get(String(targetId));
+
+        session.postings.forEach(pObj => {
+            const pIdStr = String(pObj.id);
+            if (apiGiveoutData && apiGiveoutData.has(pIdStr)) {
+                const itemMeta = apiGiveoutData.get(pIdStr);
+                if (itemMeta.isReturn) {
+                    pObj.status = 'annulated';
+                    pObj.reasonText = itemMeta.reasonId ? `Причина #${itemMeta.reasonId}` : 'Отказ клиента';
+                    annulatedCount++;
+                } else {
+                    pObj.status = 'issued';
+                    issuedCount++;
+                }
+            } else {
+                // Если закрыто штатно (completed), считаем товары выданными
+                if (reason === 'completed') {
+                    pObj.status = 'issued';
+                    issuedCount++;
+                } else {
+                    pObj.status = 'storage';
+                    storageCount++;
+                }
+            }
+        });
+
+        let summaryText = 'Сессия завершена';
+        if (reason === 'completed') summaryText = 'Заказ успешно выдан';
+        else if (reason === 'manual_dock') summaryText = 'Закрыто вручную через Dock';
+        else if (reason === 'manual_back') summaryText = 'Выход назад на /orders';
+        else if (reason === 'tab_unloaded') summaryText = 'Вкладка закрыта/обновлена';
+
+        summaryText += ` (Выдано: ${issuedCount}, Отказ: ${annulatedCount}, Хранение: ${storageCount})`;
+        session.timeline.push({ time: Date.now(), type: 'finish', text: summaryText });
+
+        // Сохраняем локально и в облако С ПРИОРИТЕТОМ
         await dbPut('sessions', session);
         cloudSyncSession(session);
-        if (activeSession && String(activeSession.sessionId) === String(targetId)) activeSession = null;
+
+        sessionGiveoutPayloads.delete(String(targetId));
+        pendingGiveoutTasks.delete(String(targetId));
+
+        if (activeSession && String(activeSession.sessionId) === String(targetId)) {
+            activeSession = null;
+        }
+
+        // Если открыт инспектор — принудительно перерисовываем список, чтобы статус обновился на глазах
+        const listEl = document.getElementById('bb-sessions-list');
+        if (listEl) {
+            renderTabContent('sessions');
+        }
     }
 
     // ================= ГЛОБАЛЬНЫЙ СЛУШАТЕЛЬ КЛАВИАТУРЫ И СКАНИРОВАНИЯ =================
@@ -651,6 +729,7 @@
             const parts = clean.split('*');
             const cId = parts[0];
             sessionStorage.setItem('client_code_pending', barcode);
+            sessionStorage.setItem('client_code_cid_' + cId, barcode);
             if (activeId) {
                 sessionStorage.setItem('client_code_' + activeId, barcode);
                 const s = await dbGet('sessions', String(activeId));
@@ -663,6 +742,7 @@
             }
             return;
         }
+
 
         let isMatchInCurrent = false;
         if (activeId) {
