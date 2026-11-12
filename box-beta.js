@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Ozon BlackBox
+// @name         Ozon BlackBox (Forensics & Audit Core)
 // @namespace    http://tampermonkey.net/
-// @version      5.1
-// @description  Ozon BlackBox 5.1 - Realtime Tags, Device Health, Remote Alerts & Inbound Relay
+// @version      5.1.1
+// @description  Ozon BlackBox 5.1.1 - Fixed Keydown Hotkeys & Full Core
 // @author       desslow
 // @match        https://*.ozon.ru/*
 // @run-at       document-start
@@ -20,7 +20,7 @@
     function getPvzId() {
         let saved = localStorage.getItem('bb_current_pvz');
         if (!saved || !PVZ_LIST.includes(saved)) {
-            saved = prompt(`[BlackBox 5.1] Выберите ПВЗ для этого ПК:\n${PVZ_LIST.join(', ')}`, PVZ_LIST[0]);
+            saved = prompt(`[BlackBox] Выберите ПВЗ для этого ПК:\n${PVZ_LIST.join(', ')}`, PVZ_LIST[0]);
             if (!PVZ_LIST.includes(saved)) saved = PVZ_LIST[0];
             localStorage.setItem('bb_current_pvz', saved);
         }
@@ -152,7 +152,6 @@
         supabaseReq('client_tags?on_conflict=client_id', 'POST', payload);
     }
 
-    // Телеметрия дисков и статуса
     async function sendDeviceHeartbeat() {
         let usageMb = 0, quotaMb = 0, percent = 0;
         if (navigator.storage && navigator.storage.estimate) {
@@ -234,7 +233,7 @@
         };
     }
 
-    // ================= INDEXEDDB SETUP =================
+    // ================= INDEXEDDB =================
     function initDB() {
         return new Promise((resolve, reject) => {
             const req = indexedDB.open(DB_NAME, DB_VERSION);
@@ -389,7 +388,6 @@
         };
     }
 
-    // Парсер приемки товара из сетевых ответов
     function parseAndRecordInboundNetwork(data) {
         if (!data) return;
         let address = data.articlePositions?.[0]?.address || data.state?.address || data.article?.address || data.address || '';
@@ -568,7 +566,200 @@
         if (activeSession && String(activeSession.sessionId) === String(targetId)) activeSession = null;
     }
 
-    // ================= BLACKBOX INSPECTOR MODAL & UI =================
+    // ================= ГЛОБАЛЬНЫЙ СЛУШАТЕЛЬ КЛАВИАТУРЫ И СКАНИРОВАНИЯ =================
+    window.addEventListener('keydown', function(e) {
+        // Хоткей открытия инспектора BlackBox
+        if (e.ctrlKey && e.shiftKey && e.altKey && e.code === 'KeyB') {
+            e.preventDefault();
+            e.stopPropagation();
+            toggleInspectorModal();
+            return;
+        }
+
+        // Закрытие окон по Escape
+        if (e.key === 'Escape') {
+            const tModal = document.getElementById('bb-tag-creator-modal');
+            if (tModal) { e.preventDefault(); e.stopPropagation(); tModal.remove(); return; }
+            const modal = document.getElementById('blackbox-modal-root');
+            if (modal) { e.preventDefault(); e.stopPropagation(); closeInspectorModal(); return; }
+        }
+
+        const now = Date.now();
+        if (now - lastScanTime > 150) scanBuffer = '';
+        lastScanTime = now;
+
+        if (e.key === 'Enter') {
+            const raw = scanBuffer.trim();
+            scanBuffer = '';
+            if (raw.length >= 4) processBarcodeScan(translit(raw));
+        } else if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
+            scanBuffer += e.key;
+        }
+    }, true);
+
+    async function processBarcodeScan(barcode) {
+        const clean = barcode.toLowerCase();
+        const now = Date.now();
+        const activeId = getActiveSessionIdOnTab();
+        const currentOp = (activeId && sessionStorage.getItem('session_operator_' + activeId)) || getOperatorLogin();
+        let currentClientName = '';
+
+        const isClientBarcode = /^\d{5,12}\*\d{3,6}$/.test(clean);
+        if (isClientBarcode) {
+            const parts = clean.split('*');
+            const cId = parts[0];
+            sessionStorage.setItem('client_code_pending', barcode);
+            if (activeId) {
+                sessionStorage.setItem('client_code_' + activeId, barcode);
+                const s = await dbGet('sessions', String(activeId));
+                if (s) {
+                    s.pickupCode = barcode;
+                    s.clientId = cId;
+                    await dbPut('sessions', s);
+                    cloudSyncSession(s);
+                }
+            }
+            return;
+        }
+
+        let isMatchInCurrent = false;
+        if (activeId) {
+            const session = await dbGet('sessions', String(activeId));
+            if (session) {
+                currentClientName = session.clientName || 'Без имени';
+                if (session.postings) {
+                    isMatchInCurrent = session.postings.some(p => {
+                        const pId = String(p.id).toLowerCase();
+                        const pBar = (p.barcode || '').toLowerCase();
+                        const bList = (p.allBarcodes || []).map(b => String(b).toLowerCase());
+                        return pId.includes(clean) || clean.includes(pId) || pBar.includes(clean) || clean.includes(pBar) || bList.some(b => b.includes(clean));
+                    });
+                }
+            }
+        }
+
+        const scanRecord = {
+            barcode: barcode, sessionId: activeId, operator: currentOp, clientName: currentClientName, time: now, isAlien: activeId ? !isMatchInCurrent : false
+        };
+        dbPut('scans_history', scanRecord);
+        cloudSyncScan(scanRecord);
+    }
+
+    // ================= МОДАЛКА СОЗДАНИЯ МЕТКИ =================
+    function openTagCreatorModal(clientId, onCreated) {
+        let ex = document.getElementById('bb-tag-creator-modal');
+        if (ex) ex.remove();
+
+        const activeId = getActiveSessionIdOnTab();
+        const currentOp = (activeId && sessionStorage.getItem('session_operator_' + activeId)) || getOperatorLogin() || 'Оператор';
+
+        const modal = document.createElement('div');
+        modal.id = 'bb-tag-creator-modal';
+        modal.innerHTML = `
+            <div class="bb-tag-dialog">
+                <div class="bb-tag-dialog-head">
+                    <span>Метка для клиента: <b>#${clientId}</b></span>
+                    <span class="bb-tag-dialog-close" id="bb-tag-cancel">✕</span>
+                </div>
+                <div class="bb-tag-dialog-body">
+                    <label class="bb-tag-label">Название метки</label>
+                    <input type="text" class="bb-input" id="bb-tag-title-inp" placeholder="..." autofocus>
+
+                    <label class="bb-tag-label">Описание</label>
+                    <textarea class="bb-input" id="bb-tag-desc-inp" rows="2" placeholder="Заметка операторам при выдаче..."></textarea>
+
+                    <label class="bb-tag-label">Цвет</label>
+                    <div class="bb-tag-colors">
+                        <label class="bb-color-opt"><input type="radio" name="tagColor" value="purple" checked><span class="bb-color-dot" style="background: #a855f7;"></span><span>Фиолетовый</span></label>
+                        <label class="bb-color-opt"><input type="radio" name="tagColor" value="amber"><span class="bb-color-dot" style="background: #f59e0b;"></span><span>Оранжевый</span></label>
+                        <label class="bb-color-opt"><input type="radio" name="tagColor" value="red"><span class="bb-color-dot" style="background: #ef4444;"></span><span>Красный</span></label>
+                        <label class="bb-color-opt"><input type="radio" name="tagColor" value="emerald"><span class="bb-color-dot" style="background: #10b981;"></span><span>Зеленый</span></label>
+                    </div>
+                </div>
+                <div class="bb-tag-dialog-foot">
+                    <button class="bb-btn-save-tag" id="bb-tag-save-btn">Сохранить</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+
+        modal.querySelector('#bb-tag-cancel').onclick = () => modal.remove();
+        modal.querySelector('#bb-tag-save-btn').onclick = async () => {
+            const title = modal.querySelector('#bb-tag-title-inp').value.trim();
+            const desc = modal.querySelector('#bb-tag-desc-inp').value.trim();
+            const color = modal.querySelector('input[name="tagColor"]:checked').value;
+
+            if (!title) {
+                modal.querySelector('#bb-tag-title-inp').focus();
+                return;
+            }
+
+            const tagObj = { title, desc, color, author: currentOp, date: Date.now() };
+            await addClientTag(clientId, tagObj);
+            modal.remove();
+            if (onCreated) onCreated();
+        };
+    }
+
+    function injectDomTags() {
+        if (!window.location.pathname.includes('/orders/session')) return;
+        const activeId = getActiveSessionIdOnTab();
+        if (!activeId) return;
+
+        const nameEl = document.querySelector('[class*="_clientName_"]');
+        if (!nameEl) return;
+
+        let wrap = nameEl.parentElement.querySelector('.bb-client-tags-wrap');
+        if (!wrap) {
+            wrap = document.createElement('div');
+            wrap.className = 'bb-client-tags-wrap';
+            nameEl.insertAdjacentElement('afterend', wrap);
+        }
+
+        const clientId = sessionStorage.getItem('client_id_' + activeId);
+        if (!clientId) return;
+
+        if (wrap.dataset.loadedClientId === clientId) return;
+        wrap.dataset.loadedClientId = clientId;
+
+        async function renderDomTags() {
+            const tags = await getClientTags(clientId);
+
+            wrap.innerHTML = tags.map(t => {
+                const dateStr = new Date(t.date || Date.now()).toLocaleDateString('ru-RU');
+                return `
+                    <div class="bb-dom-tag-badge color-${t.color || 'purple'}">
+                        <span>${t.title}</span>
+                        <span class="bb-dom-tag-rm" data-tag="${t.title}" title="Удалить метку">×</span>
+                        <div class="bb-tag-tooltip">
+                            <div class="bb-tt-title">${t.title}</div>
+                            ${t.desc ? `<div class="bb-tt-desc">${t.desc}</div>` : ''}
+                            <div class="bb-tt-meta">Автор: <b>${t.author}</b> · ${dateStr}</div>
+                        </div>
+                    </div>
+                `;
+            }).join('') + `<button type="button" class="bb-dom-tag-add">+ Метка</button>`;
+
+            wrap.querySelectorAll('.bb-dom-tag-rm').forEach(rm => {
+                rm.onclick = async (e) => {
+                    e.stopPropagation();
+                    if (confirm(`Удалить метку "${rm.dataset.tag}"?`)) {
+                        await removeClientTag(clientId, rm.dataset.tag);
+                        renderDomTags();
+                    }
+                };
+            });
+
+            wrap.querySelector('.bb-dom-tag-add').onclick = (e) => {
+                e.stopPropagation();
+                openTagCreatorModal(clientId, renderDomTags);
+            };
+        }
+        renderDomTags();
+    }
+    setInterval(injectDomTags, 400);
+
+    // ================= BLACKBOX INSPECTOR CSS =================
     const modalStyle = document.createElement('style');
     modalStyle.innerHTML = `
         #blackbox-modal-root, #bb-tag-creator-modal {
@@ -688,12 +879,6 @@
         .bb-tt-title { font-size: 12px; font-weight: 800; color: #f8fafc; margin-bottom: 2px; }
         .bb-tt-desc { font-size: 11px; color: #cbd5e1; line-height: 1.3; margin-bottom: 4px; word-break: break-word; }
         .bb-tt-meta { font-size: 9px; color: #64748b; font-family: monospace; border-top: 1px solid rgba(255,255,255,0.08); padding-top: 4px; }
-
-        .bb-posting-placement-badge {
-            background: rgba(16, 185, 129, 0.12) !important; border: 1px solid rgba(16, 185, 129, 0.3) !important;
-            color: #34d399 !important; padding: 3px 7px !important; border-radius: 6px !important; font-size: 11px !important;
-            margin-top: 5px !important; display: inline-flex !important; align-items: center !important; gap: 6px !important;
-        }
 
         .bb-stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
         .bb-stat-card { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 14px; display: flex; flex-direction: column; gap: 4px; }
@@ -1230,7 +1415,6 @@
         }
     }
 
-    // Служебные циклы
     setInterval(sendDeviceHeartbeat, 30000);
     setInterval(cloudSyncTagsPull, 8000);
     setInterval(checkRemoteAlerts, 10000);
