@@ -638,7 +638,6 @@
         let session = await dbGet('sessions', String(targetId));
         if (!session) return;
 
-        // Если сессия уже закрыта официально и имеет статус не active — не дублируем
         if (session.closedAt && session.closeReason !== 'active') return;
 
         session.closedAt = Date.now();
@@ -653,22 +652,46 @@
 
         session.postings.forEach(pObj => {
             const pIdStr = String(pObj.id);
-            if (apiGiveoutData && apiGiveoutData.has(pIdStr)) {
-                const itemMeta = apiGiveoutData.get(pIdStr);
-                if (itemMeta.isReturn) {
-                    pObj.status = 'annulated';
-                    pObj.reasonText = itemMeta.reasonId ? `Причина #${itemMeta.reasonId}` : 'Отказ клиента';
-                    annulatedCount++;
+
+            // 1. ПРОВЕРКА ПО ПЕРЕХВАЧЕННОМУ СЕТЕВОМУ GIVE-OUT ПАКЕТУ
+            if (apiGiveoutData) {
+                if (apiGiveoutData.has(pIdStr)) {
+                    const itemMeta = apiGiveoutData.get(pIdStr);
+                    if (itemMeta.isReturn) {
+                        pObj.status = 'annulated';
+                        pObj.reasonText = itemMeta.reasonId ? `Причина #${itemMeta.reasonId}` : 'Отказ клиента';
+                        annulatedCount++;
+                    } else {
+                        pObj.status = 'issued';
+                        issuedCount++;
+                    }
                 } else {
-                    pObj.status = 'issued';
-                    issuedCount++;
+                    // Товара не было в запросе выдачи — он остался на складе!
+                    pObj.status = 'storage';
+                    storageCount++;
                 }
-            } else {
-                // Если закрыто штатно (completed), считаем товары выданными
-                if (reason === 'completed') {
-                    pObj.status = 'issued';
-                    issuedCount++;
+            } 
+            // 2. ФОЛЛБЭК: АНАЛИЗ DOM КАРТОЧКИ ТОВАРА НА ЭКРАНЕ
+            else {
+                const cardWrapper = document.querySelector(`[data-testid="${pObj.id}"]`) || 
+                                    Array.from(document.querySelectorAll('[class*="_card_"]')).find(c => c.textContent.includes(pObj.name) || (pObj.barcode && c.textContent.includes(pObj.barcode)));
+
+                if (cardWrapper) {
+                    const txt = cardWrapper.textContent;
+                    if (txt.includes('К аннуляции') || txt.includes('Отказ')) {
+                        pObj.status = 'annulated';
+                        const reasonBtn = Array.from(cardWrapper.querySelectorAll('button')).find(b => b.textContent.includes('К аннуляции'));
+                        pObj.reasonText = reasonBtn ? reasonBtn.textContent.replace('К аннуляции:', '').trim() : 'Отказ';
+                        annulatedCount++;
+                    } else if (txt.includes('К выдаче') && !txt.includes('На хранении')) {
+                        pObj.status = 'issued';
+                        issuedCount++;
+                    } else {
+                        pObj.status = 'storage';
+                        storageCount++;
+                    }
                 } else {
+                    // Если карточки нет в DOM и запроса не было — товар точно на хранении
                     pObj.status = 'storage';
                     storageCount++;
                 }
@@ -676,7 +699,7 @@
         });
 
         let summaryText = 'Сессия завершена';
-        if (reason === 'completed') summaryText = 'Заказ успешно выдан';
+        if (reason === 'completed') summaryText = 'Выдача проведена';
         else if (reason === 'manual_dock') summaryText = 'Закрыто вручную через Dock';
         else if (reason === 'manual_back') summaryText = 'Выход назад на /orders';
         else if (reason === 'tab_unloaded') summaryText = 'Вкладка закрыта/обновлена';
@@ -684,7 +707,6 @@
         summaryText += ` (Выдано: ${issuedCount}, Отказ: ${annulatedCount}, Хранение: ${storageCount})`;
         session.timeline.push({ time: Date.now(), type: 'finish', text: summaryText });
 
-        // Сохраняем локально и в облако С ПРИОРИТЕТОМ
         await dbPut('sessions', session);
         cloudSyncSession(session);
 
@@ -695,13 +717,9 @@
             activeSession = null;
         }
 
-        // Если открыт инспектор — принудительно перерисовываем список, чтобы статус обновился на глазах
         const listEl = document.getElementById('bb-sessions-list');
-        if (listEl) {
-            renderTabContent('sessions');
-        }
+        if (listEl) renderTabContent('sessions');
     }
-
     // ================= ГЛОБАЛЬНЫЙ СЛУШАТЕЛЬ КЛАВИАТУРЫ И СКАНИРОВАНИЯ =================
     window.addEventListener('keydown', function(e) {
         // Хоткей открытия инспектора BlackBox
