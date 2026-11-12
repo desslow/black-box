@@ -423,10 +423,12 @@
             finalizeActiveSession(closedId, 'completed');
         }
 
+        // 2. Обработка выдачи giveout-v3
         if (url.includes('/api2/giveout/Postings/giveout-v3')) {
             try {
                 const parsedReq = typeof reqBody === 'string' ? JSON.parse(reqBody) : reqBody;
                 const parsedRes = typeof resData === 'string' ? JSON.parse(resData) : resData;
+                
                 if (parsedReq && parsedReq.sessionId) {
                     const sId = String(parsedReq.sessionId);
                     const postingsMap = new Map();
@@ -435,9 +437,49 @@
                         postingsMap.set(String(p.id), { isReturn, reasonId: p.returnReasonId });
                     });
                     sessionGiveoutPayloads.set(sId, postingsMap);
-                    if (parsedRes && Array.isArray(parsedRes.tasks)) {
-                        parsedRes.tasks.forEach(t => pendingGiveoutTasks.set(String(t.taskId), { sessionId: sId, postingIds: t.postingIds }));
-                    } else finalizeActiveSession(sId, 'completed');
+
+                    // Фикс: ловим taskId в любых вариациях Озона (id / taskId)
+                    const taskList = parsedRes?.tasks || parsedRes?.data?.tasks;
+                    if (Array.isArray(taskList) && taskList.length > 0) {
+                        taskList.forEach(t => {
+                            const taskIdStr = String(t.taskId || t.id);
+                            pendingGiveoutTasks.set(taskIdStr, { sessionId: sId });
+                        });
+                    } else {
+                        // Если тасок нет или статус сразу выполнен — закрываем немедленно
+                        finalizeActiveSession(sId, 'completed');
+                    }
+                }
+            } catch (e) {
+                // Если парсинг упал — страхуем по текущей активной сессии
+                finalizeActiveSession(null, 'completed');
+            }
+        }
+
+        // 3. Статусы тасок giveout-v2-tasks-statuses
+        if (url.includes('/api2/giveout/Postings/giveout-v2-tasks-statuses') || url.includes('/tasks-statuses')) {
+            try {
+                const parsedRes = typeof resData === 'string' ? JSON.parse(resData) : resData;
+                const statusList = parsedRes?.statuses || parsedRes?.data?.statuses;
+
+                if (Array.isArray(statusList)) {
+                    statusList.forEach(st => {
+                        const tId = String(st.id || st.taskId);
+                        const isDone = st.status === 'Processed' || st.status === 'Success' || st.status === 'Completed';
+
+                        if (isDone && pendingGiveoutTasks.has(tId)) {
+                            const taskInfo = pendingGiveoutTasks.get(tId);
+                            pendingGiveoutTasks.delete(tId);
+
+                            let hasActive = false;
+                            for (let entry of pendingGiveoutTasks.values()) {
+                                if (entry.sessionId === taskInfo.sessionId) { hasActive = true; break; }
+                            }
+                            if (!hasActive) {
+                                finalizeActiveSession(taskInfo.sessionId, 'completed');
+                            }
+                        }
+                    });
                 }
             } catch (e) {}
         }
@@ -1418,6 +1460,35 @@
     setInterval(sendDeviceHeartbeat, 30000);
     setInterval(cloudSyncTagsPull, 8000);
     setInterval(checkRemoteAlerts, 10000);
+
+    // Фоллбэк-детектор завершения выдачи по кнопкам и смене URL
+    document.addEventListener('click', (e) => {
+        const btn = e.target.closest('button');
+        if (!btn) return;
+        const txt = btn.textContent.trim();
+
+        if (txt === 'Выдать' || txt.startsWith('Выдать ') || txt === 'Завершить' || txt.startsWith('Завершить ')) {
+            const activeId = getActiveSessionIdOnTab();
+            if (activeId) {
+                setTimeout(() => {
+                    finalizeActiveSession(activeId, 'completed');
+                }, 350);
+            }
+        }
+    }, true);
+
+    // Детектор ухода со страницы сессии на /orders
+    let lastUrlPath = window.location.pathname;
+    setInterval(() => {
+        const curPath = window.location.pathname;
+        if (lastUrlPath.includes('/orders/session') && !curPath.includes('/orders/session')) {
+            const match = lastUrlPath.match(/\/orders\/session(?:-new)?\/(\d+)/);
+            if (match && match[1]) {
+                finalizeActiveSession(match[1], 'completed');
+            }
+        }
+        lastUrlPath = curPath;
+    }, 300);
 
     initDB();
 })();
