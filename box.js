@@ -634,6 +634,7 @@
             barcode: barcode,
             sessionId: activeId,
             operator: currentOp,
+            clientName: currentClientName,
             time: now,
             isAlien: activeId ? !isMatchInCurrent : false
         });
