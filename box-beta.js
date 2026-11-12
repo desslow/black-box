@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ozon BlackBox (Forensics & Audit Core)
 // @namespace    http://tampermonkey.net/
-// @version      3.0
-// @description  Ozon BlackBox: Forensics, Anti-Fraud Client Badges & Visual Timeline
+// @version      3.3
+// @description  Ozon BlackBox: Forensics, Anti-Fraud Client Badges & Visual Timeline (Stealth Edition)
 // @author       desslow
 // @match        https://*.ozon.ru/*
 // @run-at       document-start
@@ -13,7 +13,7 @@
     'use strict';
 
     const DB_NAME = '_o3_telemetry_cache';
-    const DB_VERSION = 2; // Апгрейд схемы под бейджи клиентов
+    const DB_VERSION = 2;
     const TTL_DAYS = 180;
     const ENABLE_DEV_PURGE = true;
 
@@ -99,7 +99,7 @@
     }
 
     function dbPut(storeName, data) {
-        if (!db) return Promise.resolve();
+        if (!db) return Promise.resolve(false);
         return new Promise((resolve) => {
             try {
                 const tx = db.transaction(storeName, 'readwrite');
@@ -135,7 +135,7 @@
     }
 
     function dbDelete(storeName, key) {
-        if (!db) return Promise.resolve();
+        if (!db) return Promise.resolve(false);
         return new Promise((resolve) => {
             try {
                 const tx = db.transaction(storeName, 'readwrite');
@@ -147,7 +147,7 @@
     }
 
     function clearEntireDB() {
-        if (!db) return Promise.resolve();
+        if (!db) return Promise.resolve(false);
         return new Promise((resolve) => {
             try {
                 const tx = db.transaction(['sessions', 'scans_history', 'client_badges'], 'readwrite');
@@ -161,8 +161,235 @@
     }
 
     /* =========================================================================
-       2. CLIENT BADGES ENGINE (CRM & Anti-Fraud)
+       2. UNIFIED STYLES (Fixed Stacking Context & Opaque Tooltip)
        ========================================================================= */
+
+    const unifiedStyle = document.createElement('style');
+    unifiedStyle.innerHTML = `
+        /* ---------------- НА ТЕМЕ OZON (СВЕТЛЫЙ НАЦИОНАЛЬНЫЙ ДИЗАЙН OZI) ---------------- */
+        
+        /* Поднимаем контейнер заголовка над табами Ozon, чтобы тултип не пробивался */
+        [class*="_client_"], [class*="_clientName_"] {
+            position: relative !important;
+            z-index: 99999 !important;
+        }
+
+        #bb-ozon-injected-badges {
+            position: relative !important;
+            z-index: 100000 !important;
+            display: inline-flex !important;
+            align-items: center !important;
+            gap: 6px !important;
+            margin-left: 12px !important;
+            vertical-align: middle !important;
+            flex-wrap: wrap !important;
+        }
+
+        .bb-ozon-add-btn {
+            background: #f2f5f9 !important;
+            color: #005bff !important;
+            border: 1px solid #dbe2ea !important;
+            font-size: 12px !important;
+            font-weight: 600 !important;
+            padding: 3px 10px !important;
+            border-radius: 8px !important;
+            cursor: pointer !important;
+            display: inline-flex !important;
+            align-items: center !important;
+            gap: 4px !important;
+            vertical-align: middle !important;
+            transition: all 0.15s ease !important;
+            font-family: inherit !important;
+            line-height: 16px !important;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.04) !important;
+        }
+        .bb-ozon-add-btn:hover {
+            background: #e8f2ff !important;
+            border-color: #b8d5ff !important;
+        }
+
+        .bb-ozon-pill {
+            position: relative !important;
+            font-size: 12px !important;
+            font-weight: 600 !important;
+            padding: 2px 8px !important;
+            border-radius: 6px !important;
+            cursor: pointer !important;
+            user-select: none !important;
+            display: inline-flex !important;
+            align-items: center !important;
+            gap: 4px !important;
+            line-height: 18px !important;
+            vertical-align: middle !important;
+            font-family: inherit !important;
+            transition: transform 0.1s ease !important;
+        }
+        .bb-ozon-pill:hover { transform: translateY(-1px); }
+
+        .bb-pill-red { background: #feecee !important; color: #f91155 !important; border: 1px solid #fcced3 !important; }
+        .bb-pill-yellow { background: #fef3c7 !important; color: #b45309 !important; border: 1px solid #fde68a !important; }
+        .bb-pill-blue { background: #e8f2ff !important; color: #005bff !important; border: 1px solid #cce2ff !important; }
+        .bb-pill-green { background: #e6f9ed !important; color: #00873e !important; border: 1px solid #b3f0cc !important; }
+
+        /* ИСПРАВЛЕННЫЙ ТУЛТИП: Полная непрозрачность, высокий слой, выпадает вниз */
+        .bb-ozon-tooltip {
+            visibility: hidden;
+            opacity: 0;
+            position: absolute;
+            top: calc(100% + 6px) !important;
+            left: 0 !important;
+            bottom: auto !important;
+            transform: translateY(-4px) !important;
+            width: 270px !important;
+            background: #ffffff !important;
+            background-color: #ffffff !important;
+            border: 1px solid #d0d7de !important;
+            color: #001a34 !important;
+            padding: 12px 14px !important;
+            border-radius: 10px !important;
+            font-size: 12px !important;
+            z-index: 1000000 !important;
+            box-shadow: 0 12px 28px rgba(0, 26, 52, 0.25), 0 0 0 1px rgba(0, 26, 52, 0.08) !important;
+            transition: opacity 0.15s ease, transform 0.15s ease !important;
+            pointer-events: none !important;
+            text-align: left !important;
+            line-height: 16px !important;
+            font-weight: normal !important;
+            white-space: normal !important;
+        }
+        .bb-ozon-pill:hover .bb-ozon-tooltip {
+            visibility: visible !important;
+            opacity: 1 !important;
+            transform: translateY(0) !important;
+        }
+
+        #bb-dialog-overlay {
+            position: fixed !important; top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important;
+            background: rgba(0, 26, 52, 0.45) !important; backdrop-filter: blur(4px) !important;
+            z-index: 20000000 !important; display: flex !important; align-items: center !important; justify-content: center !important;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+        }
+        .bb-ozon-dialog {
+            background: #ffffff !important; border-radius: 16px !important; width: 440px !important;
+            padding: 24px !important; box-shadow: 0 20px 40px rgba(0, 26, 52, 0.18) !important;
+            display: flex !important; flex-direction: column !important; gap: 14px !important; color: #001a34 !important;
+        }
+        .bb-dialog-title { font-size: 18px !important; font-weight: 700 !important; color: #001a34 !important; margin: 0 !important; }
+        .bb-dialog-sub { font-size: 13px !important; color: #707f8d !important; margin-top: -8px !important; }
+
+        .bb-ozon-input {
+            width: 100% !important; box-sizing: border-box !important; background: #ffffff !important;
+            border: 1px solid #d0d7de !important; border-radius: 8px !important; padding: 10px 12px !important;
+            font-size: 14px !important; color: #001a34 !important; outline: none !important; transition: border-color 0.15s, box-shadow 0.15s !important;
+        }
+        .bb-ozon-input:focus {
+            border-color: #005bff !important; box-shadow: 0 0 0 3px rgba(0, 91, 255, 0.15) !important;
+        }
+
+        .bb-color-chips { display: flex !important; gap: 8px !important; }
+        .bb-color-chip {
+            flex: 1 !important; padding: 7px 4px !important; border-radius: 8px !important; font-size: 12px !important;
+            font-weight: 600 !important; text-align: center !important; cursor: pointer !important; border: 2px solid transparent !important;
+            user-select: none !important; transition: all 0.15s ease !important;
+        }
+        .bb-color-chip.active { border-color: #001a34 !important; transform: scale(1.02); }
+
+        .bb-dialog-actions { display: flex !important; justify-content: flex-end !important; gap: 10px !important; margin-top: 6px !important; }
+        .bb-btn-ozon-secondary {
+            background: #f2f5f9 !important; color: #001a34 !important; border: none !important; padding: 9px 16px !important;
+            border-radius: 8px !important; font-weight: 600 !important; font-size: 13px !important; cursor: pointer !important;
+        }
+        .bb-btn-ozon-secondary:hover { background: #e4e8ee !important; }
+        .bb-btn-ozon-primary {
+            background: #005bff !important; color: #ffffff !important; border: none !important; padding: 9px 18px !important;
+            border-radius: 8px !important; font-weight: 600 !important; font-size: 13px !important; cursor: pointer !important;
+            transition: background 0.15s !important;
+        }
+        .bb-btn-ozon-primary:hover { background: #004ed6 !important; }
+
+        /* ---------------- МОДАЛКА ИНСПЕКТОРА (BLACKBOX DARK) ---------------- */
+        #blackbox-modal-root {
+            position: fixed !important; top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important;
+            background: rgba(2, 6, 23, 0.85) !important; backdrop-filter: blur(25px) saturate(180%) !important;
+            z-index: 10000000 !important; display: flex !important; align-items: center !important; justify-content: center !important;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important; color: #f8fafc !important;
+        }
+        .bb-window {
+            width: 1140px !important; max-width: 96vw !important; height: 820px !important; max-height: 94vh !important;
+            background: #0b1120 !important; border: 1px solid rgba(255, 255, 255, 0.12) !important;
+            border-radius: 20px !important; box-shadow: 0 30px 80px rgba(0,0,0,0.8) !important;
+            display: flex !important; flex-direction: column !important; overflow: hidden !important;
+        }
+        .bb-header {
+            display: flex !important; align-items: center !important; justify-content: space-between !important;
+            padding: 16px 24px !important; border-bottom: 1px solid rgba(255, 255, 255, 0.08) !important;
+            background: rgba(255, 255, 255, 0.02) !important;
+        }
+        .bb-title { font-size: 16px !important; font-weight: 800 !important; letter-spacing: 0.5px !important; }
+        .bb-title span { color: #38bdf8 !important; }
+        .bb-tabs { display: flex !important; gap: 8px !important; }
+        .bb-tab-btn {
+            background: transparent !important; border: 1px solid transparent !important; color: #94a3b8 !important;
+            padding: 6px 14px !important; border-radius: 8px !important; font-size: 12px !important; font-weight: 600 !important;
+            cursor: pointer !important; transition: all 0.2s !important;
+        }
+        .bb-tab-btn:hover { color: #fff !important; background: rgba(255, 255, 255, 0.05) !important; }
+        .bb-tab-btn.active { color: #38bdf8 !important; background: rgba(56, 189, 248, 0.12) !important; border-color: rgba(56, 189, 248, 0.3) !important; }
+        .bb-close { color: #64748b !important; cursor: pointer !important; font-size: 20px !important; }
+        .bb-close:hover { color: #fff !important; }
+
+        .bb-body { flex: 1 1 auto !important; display: flex !important; overflow: hidden !important; }
+        .bb-main-view { flex: 1 1 auto !important; padding: 20px !important; overflow-y: auto !important; display: flex !important; flex-direction: column !important; gap: 12px !important; }
+        .bb-replay-view { width: 440px !important; min-width: 440px !important; border-left: 1px solid rgba(255, 255, 255, 0.08) !important; background: #070a12 !important; padding: 18px !important; display: flex !important; flex-direction: column !important; gap: 10px !important; overflow-y: auto !important; }
+
+        .bb-input {
+            background: rgba(255, 255, 255, 0.05) !important; border: 1px solid rgba(255, 255, 255, 0.12) !important;
+            color: #fff !important; padding: 8px 12px !important; border-radius: 8px !important; font-size: 13px !important; outline: none !important;
+        }
+        .bb-input:focus { border-color: #38bdf8 !important; }
+        .bb-btn {
+            background: #1e293b; color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); padding: 8px 14px;
+            border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.15s;
+        }
+        .bb-btn:hover { background: #0284c7; color: #fff; }
+        .bb-btn-danger { background: rgba(239, 68, 68, 0.15); color: #f87171; border-color: rgba(239, 68, 68, 0.3); }
+        .bb-btn-danger:hover { background: #ef4444; color: #fff; }
+
+        .bb-gantt-day-block { display: flex; flex-direction: column; gap: 6px; margin-bottom: 20px; }
+        .bb-gantt-day-title { font-size: 13px; font-weight: 700; color: #38bdf8; display: flex; justify-content: space-between; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 6px; }
+        .bb-swimlane-row { display: flex; gap: 8px; align-items: stretch; margin-top: 4px; }
+        .bb-swimlane-track { flex: 1; display: flex; flex-direction: column; gap: 6px; background: rgba(255,255,255,0.015); border-radius: 8px; padding: 6px; border: 1px dashed rgba(255,255,255,0.05); }
+
+        .bb-session-bar {
+            background: #131d31; border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; padding: 8px 12px;
+            cursor: pointer; transition: all 0.15s; display: flex; flex-direction: column; gap: 4px; position: relative;
+        }
+        .bb-session-bar:hover { background: #1c2b46; border-color: #38bdf8; transform: translateY(-1px); }
+        .bb-session-bar.has-alien { border-left: 3px solid #ef4444 !important; }
+
+        .bb-stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
+        .bb-stat-card {
+            background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px;
+            padding: 14px; display: flex; flex-direction: column; gap: 4px;
+        }
+        .bb-stat-val { font-size: 24px; font-weight: 800; color: #f8fafc; }
+        .bb-stat-lbl { font-size: 11px; color: #94a3b8; font-weight: 600; text-transform: uppercase; }
+
+        .bb-progress-bar { width: 100%; height: 8px; background: rgba(255,255,255,0.08); border-radius: 4px; overflow: hidden; margin: 8px 0; }
+        .bb-progress-fill { height: 100%; background: linear-gradient(90deg, #38bdf8, #818cf8); border-radius: 4px; transition: width 0.3s; }
+    `;
+    document.head.appendChild(unifiedStyle);
+
+    /* =========================================================================
+       3. CLIENT BADGES ENGINE (CRM & Anti-Fraud)
+       ========================================================================= */
+
+    function getPillClass(color) {
+        if (color === '#f59e0b') return 'bb-pill-yellow';
+        if (color === '#005bff' || color === '#3b82f6') return 'bb-pill-blue';
+        if (color === '#10b981' || color === '#00873e') return 'bb-pill-green';
+        return 'bb-pill-red';
+    }
 
     async function getClientBadges(clientId) {
         if (!clientId) return [];
@@ -206,122 +433,135 @@
     }
 
     function triggerBadgesRerender() {
+        const wrapper = document.getElementById('bb-ozon-injected-badges');
+        if (wrapper) wrapper.dataset.renderedKey = '';
         renderBadgesInOzonUI();
         const activeTab = document.querySelector('.bb-tab-btn.active')?.dataset?.tab;
         if (activeTab === 'sessions') renderTabContent('sessions');
+        if (activeTab === 'badges') renderTabContent('badges');
         if (activeSession) renderSessionReplay(activeSession);
     }
 
-    // Внедрение бейджей в нативный DOM Ozon на странице выдачи
     async function renderBadgesInOzonUI() {
         const sId = getActiveSessionIdOnTab();
         if (!sId) return;
 
-        const session = await dbGet('sessions', sId);
-        const clientId = session?.clientId || sessionStorage.getItem('client_id_' + sId);
-        if (!clientId) return;
+        let session = await dbGet('sessions', sId);
+        let clientId = session?.clientId || activeSession?.clientId || sessionStorage.getItem('client_id_' + sId);
+        let clientName = session?.clientName || activeSession?.clientName || '';
 
-        const badges = await getClientBadges(clientId);
-        
-        // Ищем контейнер с именем клиента
-        const nameHeader = document.querySelector('[class*="clientName"], [class*="ClientName"], [data-testid="client-name"]');
+        const nameHeader = document.querySelector('[class*="_clientName_"]') ||
+                           document.querySelector('[class*="_client_"] [class*="heading"]') ||
+                           document.querySelector('[data-testid="client-name"]');
         if (!nameHeader) return;
 
-        let badgeWrapper = document.getElementById('bb-ozon-injected-badges');
+        if (!clientName) {
+            clientName = nameHeader.childNodes[0]?.textContent?.trim() || 'Клиент';
+        }
+
+        // Если сессия еще не сохранена в IndexedDB, запускаем DOM-автосборщик прямо сейчас!
+        if (!session) {
+            harvestSessionFromDOM(sId);
+        }
+
+        const effectiveId = clientId || ('s_' + sId);
+        const badges = clientId ? await getClientBadges(clientId) : [];
+        const renderKey = `${effectiveId}_${badges.length}_${badges.map(b => b.id).join(',')}`;
+
+        let badgeWrapper = nameHeader.querySelector('#bb-ozon-injected-badges');
         if (!badgeWrapper) {
             badgeWrapper = document.createElement('div');
             badgeWrapper.id = 'bb-ozon-injected-badges';
-            badgeWrapper.style.cssText = 'display: inline-flex; align-items: center; gap: 6px; margin-left: 10px; vertical-align: middle; flex-wrap: wrap;';
             nameHeader.appendChild(badgeWrapper);
         }
 
+        if (badgeWrapper.dataset.renderedKey === renderKey) return;
+        badgeWrapper.dataset.renderedKey = renderKey;
+
         badgeWrapper.innerHTML = `
             ${badges.map(b => `
-                <div class="bb-ozon-pill" style="background: ${b.color}22; border: 1px solid ${b.color}; color: ${b.color};" data-tip="${encodeURIComponent(b.desc)}">
-                    <span>⚠️ ${b.title}</span>
+                <div class="bb-ozon-pill ${getPillClass(b.color)}">
+                    <span>${b.title}</span>
                     <div class="bb-ozon-tooltip">
-                        <div style="font-weight: 700; margin-bottom: 2px;">${b.title}</div>
-                        <div>${b.desc || 'Нет описания'}</div>
-                        <div style="font-size: 9px; opacity: 0.7; margin-top: 4px;">Установил: ${b.author}</div>
+                        <div style="font-weight: 700; color: #001a34; margin-bottom: 4px; font-size: 13px;">${b.title}</div>
+                        <div style="color: #495867;">${b.desc || 'Нет описания инцидента'}</div>
+                        <div style="font-size: 10px; color: #8c9ba7; margin-top: 6px; border-top: 1px solid #f0f2f5; padding-top: 4px;">Автор: ${b.author}</div>
                     </div>
                 </div>
             `).join('')}
-            <button id="bb-add-badge-quick-btn" class="bb-ozon-add-btn" title="Добавить метку клиенту">+ Метка</button>
+            <button id="bb-add-badge-quick-btn" class="bb-ozon-add-btn" type="button" title="Добавить служебную метку клиенту">+ Метка</button>
         `;
 
         badgeWrapper.querySelector('#bb-add-badge-quick-btn').onclick = (e) => {
+            e.preventDefault();
             e.stopPropagation();
-            showCreateBadgeDialog(clientId, session?.clientName || 'Клиент');
+            showCreateBadgeDialog(clientId || sId, clientName);
         };
     }
 
     function showCreateBadgeDialog(clientId, clientName) {
+        const existing = document.getElementById('bb-dialog-overlay');
+        if (existing) existing.remove();
+
         const overlay = document.createElement('div');
         overlay.id = 'bb-dialog-overlay';
+
+        let selectedColor = '#ef4444';
+
         overlay.innerHTML = `
-            <div class="bb-dialog">
-                <div style="font-weight: 800; font-size: 15px; margin-bottom: 6px;">Добавить метку для: ${clientName}</div>
-                <div style="font-size: 11px; color: #94a3b8; margin-bottom: 12px;">ID клиента: ${clientId}</div>
-                
-                <input type="text" id="bb-badge-title-input" class="bb-input" placeholder="Название (например: НЕ ОПЛАТИЛ, БРАКОДЕЛ)" style="width: 100%; margin-bottom: 8px;">
-                <textarea id="bb-badge-desc-input" class="bb-input" placeholder="Подробное описание инцидента (заказ, дата, сумма)..." style="width: 100%; height: 70px; resize: none; margin-bottom: 8px;"></textarea>
-                
-                <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 14px;">
-                    <span style="font-size: 12px; color: #94a3b8;">Цвет:</span>
-                    <select id="bb-badge-color-select" class="bb-input" style="padding: 4px 8px;">
-                        <option value="#ef4444" selected>🔴 Красный (Опасность / Кража)</option>
-                        <option value="#f59e0b">🟡 Желтый (Внимание / Проблема)</option>
-                        <option value="#3b82f6">🔵 Синий (Заметка / Информация)</option>
-                        <option value="#10b981">🟢 Зеленый (VIP / Доверие)</option>
-                    </select>
+            <div class="bb-ozon-dialog">
+                <div>
+                    <h3 class="bb-dialog-title">Метка клиента</h3>
+                    <div class="bb-dialog-sub">${clientName} (ID: ${clientId})</div>
                 </div>
 
-                <div style="display: flex; justify-content: flex-end; gap: 8px;">
-                    <button class="bb-btn" id="bb-badge-cancel" style="background: transparent;">Отмена</button>
-                    <button class="bb-btn" id="bb-badge-save" style="background: #ef4444; color: #fff;">Сохранить метку</button>
+                <input type="text" id="bb-badge-title-input" class="bb-ozon-input" placeholder="Название (например: НЕ ОПЛАТИЛ, БРАКЕР)" autofocus>
+                <textarea id="bb-badge-desc-input" class="bb-ozon-input" placeholder="Подробности (сумма долга, дата инцидента, номер заказа)..." style="height: 74px; resize: none;"></textarea>
+
+                <div>
+                    <div style="font-size: 12px; font-weight: 600; color: #707f8d; margin-bottom: 6px;">ТИП И ЦВЕТ МЕТКИ</div>
+                    <div class="bb-color-chips">
+                        <div class="bb-color-chip bb-pill-red active" data-color="#ef4444">🔴 Опасность</div>
+                        <div class="bb-color-chip bb-pill-yellow" data-color="#f59e0b">🟡 Внимание</div>
+                        <div class="bb-color-chip bb-pill-blue" data-color="#005bff">🔵 Заметка</div>
+                        <div class="bb-color-chip bb-pill-green" data-color="#10b981">🟢 Доверие</div>
+                    </div>
+                </div>
+
+                <div class="bb-dialog-actions">
+                    <button class="bb-btn-ozon-secondary" id="bb-badge-cancel" type="button">Отмена</button>
+                    <button class="bb-btn-ozon-primary" id="bb-badge-save" type="button">Сохранить метку</button>
                 </div>
             </div>
         `;
         document.body.appendChild(overlay);
 
+        const chips = overlay.querySelectorAll('.bb-color-chip');
+        chips.forEach(chip => {
+            chip.onclick = () => {
+                chips.forEach(c => c.classList.remove('active'));
+                chip.classList.add('active');
+                selectedColor = chip.dataset.color;
+            };
+        });
+
         overlay.querySelector('#bb-badge-cancel').onclick = () => overlay.remove();
+        overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+
         overlay.querySelector('#bb-badge-save').onclick = async () => {
-            const title = overlay.querySelector('#bb-badge-title-input').value;
-            const desc = overlay.querySelector('#bb-badge-desc-input').value;
-            const color = overlay.querySelector('#bb-badge-color-select').value;
+            const title = overlay.querySelector('#bb-badge-title-input').value.trim();
+            const desc = overlay.querySelector('#bb-badge-desc-input').value.trim();
             if (title) {
-                await addClientBadge(clientId, title, desc, color);
+                await addClientBadge(clientId, title, desc, selectedColor);
                 overlay.remove();
+            } else {
+                overlay.querySelector('#bb-badge-title-input').focus();
             }
         };
     }
 
     /* =========================================================================
-       3. SOUND & AUDIO ALERT ENGINE
-       ========================================================================= */
-
-    function playAlertSound(type = 'alien') {
-        try {
-            const ctx = new (window.AudioContext || window.webkitAudioContext)();
-            const osc = ctx.createOscillator();
-            const gain = ctx.createGain();
-
-            if (type === 'alien') {
-                osc.type = 'sawtooth';
-                osc.frequency.setValueAtTime(880, ctx.currentTime);
-                osc.frequency.setValueAtTime(440, ctx.currentTime + 0.12);
-                gain.gain.setValueAtTime(0.3, ctx.currentTime);
-                gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.3);
-                osc.connect(gain);
-                gain.connect(ctx.destination);
-                osc.start();
-                osc.stop(ctx.currentTime + 0.3);
-            }
-        } catch(e) {}
-    }
-
-    /* =========================================================================
-       4. CODE CAPTURE & FORENSICS TRACKER
+       4. CODE CAPTURE & DOM AUTO-HARVESTER (Гарантия сохранения)
        ========================================================================= */
 
     function getOperatorLogin() {
@@ -334,7 +574,6 @@
         return (window.location.pathname.match(/\/orders\/session(?:-new)?\/(\d+)/) || [])[1] || null;
     }
 
-    // Сохранение и защита реального кода выдачи от затирания
     function storeSafePickupCode(sId, code) {
         if (!code || code.includes('----')) return;
         sessionStorage.setItem('client_code_' + sId, code);
@@ -365,18 +604,51 @@
         };
     }
 
+    // Резервный сборщик сессии прямо из DOM страницы (если сеть закэширована)
+    async function harvestSessionFromDOM(sId) {
+        const nameHeader = document.querySelector('[class*="_clientName_"]') || document.querySelector('[data-testid="client-name"]');
+        const shelfEl = document.querySelector('[class*="_shelf_"], [class*="_shelves_"]');
+        const clientName = nameHeader ? nameHeader.childNodes[0]?.textContent?.trim() || '' : '';
+        const shelves = shelfEl ? shelfEl.textContent.replace('Ячейки', '').trim() : '';
+        const clientId = sessionStorage.getItem('client_id_' + sId) || '';
+        const pickupCode = sessionStorage.getItem('client_code_' + sId) || sessionStorage.getItem('client_code_pending') || (clientId ? `${clientId}*----` : '');
+
+        let session = await dbGet('sessions', String(sId));
+        if (!session) {
+            session = {
+                sessionId: String(sId),
+                clientId: String(clientId),
+                clientName: clientName,
+                pickupCode: pickupCode,
+                foundAt: Date.now(),
+                closedAt: null,
+                durationSec: 0,
+                operator: getOperatorLogin(),
+                shelves: shelves,
+                closeReason: 'active',
+                postings: [],
+                timeline: [{ time: Date.now(), type: 'start', text: 'Сессия открыта' }],
+                alienScans: [],
+                tabId: TAB_ID
+            };
+            activeSession = session;
+            await dbPut('sessions', session);
+        }
+        return session;
+    }
+
     async function handleSessionPostingsData(sessionId, data) {
-        if (!data || !data.postings) return;
+        if (!data) return;
         const sId = String(sessionId);
 
-        const readyPostings = (data.postings || []).filter(p => p.pvzState === 'ReadyToGiveout' || !p.pvzState);
+        const postingsArray = data.postings || data.result?.postings || (Array.isArray(data) ? data : []);
+        const readyPostings = postingsArray.filter(p => p.pvzState === 'ReadyToGiveout' || !p.pvzState);
         currentPostingsList = readyPostings;
 
-        const clientId = data.client?.ozonClientId || data.client?.clientId || '';
+        const clientId = data.client?.ozonClientId || data.client?.clientId || sessionStorage.getItem('client_id_' + sId) || '';
         const clientName = data.client?.clientShortName || '';
         const shelves = Array.isArray(data.postingsShelves) ? data.postingsShelves.join(', ') : '';
 
-        // Восстановление реального кода
         let realCode = sessionStorage.getItem('client_code_' + sId) || sessionStorage.getItem('client_code_pending');
         if (!realCode && clientId) {
             realCode = `${clientId}*----`;
@@ -407,32 +679,31 @@
             if (clientId) session.clientId = String(clientId);
             if (clientName) session.clientName = clientName;
             if (shelves) session.shelves = shelves;
-            // НЕ перезаписываем реальный код маской
             if (realCode && !realCode.includes('----')) {
                 session.pickupCode = realCode;
             }
-            if (!session.postings || session.postings.length === 0) {
+            if (readyPostings.length > 0) {
                 session.postings = readyPostings.map(extractPostingDetails);
             }
         }
 
         activeSession = session;
         await dbPut('sessions', session);
-        setTimeout(renderBadgesInOzonUI, 300);
+        setTimeout(renderBadgesInOzonUI, 150);
     }
 
     async function recordTimelineEvent(sId, type, text, isAlien = false, extraData = {}) {
         const targetId = sId ? String(sId) : (activeSession ? activeSession.sessionId : null);
         if (!targetId) return;
 
-        const session = await dbGet('sessions', targetId);
+        let session = await dbGet('sessions', targetId);
+        if (!session) session = await harvestSessionFromDOM(targetId);
         if (!session) return;
 
         const ev = { time: Date.now(), type, text, isAlien, ...extraData };
         session.timeline.push(ev);
         if (isAlien) {
             session.alienScans.push(ev);
-            playAlertSound('alien');
         }
         activeSession = session;
         await dbPut('sessions', session);
@@ -442,7 +713,8 @@
         const targetId = sId ? String(sId) : (activeSession ? activeSession.sessionId : getActiveSessionIdOnTab());
         if (!targetId) return;
 
-        const session = await dbGet('sessions', String(targetId));
+        let session = await dbGet('sessions', String(targetId));
+        if (!session) session = await harvestSessionFromDOM(targetId);
         if (!session || session.closedAt) return;
 
         session.closedAt = Date.now();
@@ -485,10 +757,7 @@
                         storageCount++;
                     }
                 } else {
-                    if (reason === 'completed' && apiGiveoutData) {
-                        pObj.status = 'storage';
-                        storageCount++;
-                    } else if (reason === 'completed') {
+                    if (reason === 'completed') {
                         pObj.status = 'issued';
                         issuedCount++;
                     } else {
@@ -553,11 +822,10 @@
     }
 
     /* =========================================================================
-       5. NETWORK INTERCEPTOR (Fetch & XHR)
+       5. NETWORK INTERCEPTOR (Универсальный перехват с регулярками)
        ========================================================================= */
 
     function interceptPayload(url, reqBody, resData, status = 200) {
-        // Перехват кода выдачи из поисковых запросов
         if (url.includes('/by-code') || url.includes('/find')) {
             try {
                 const parsedReq = typeof reqBody === 'string' ? JSON.parse(reqBody) : reqBody;
@@ -578,7 +846,6 @@
             finalizeActiveSession(closedId, 'completed');
         }
 
-        // Перехват giveout-v3
         if (url.includes('/api2/giveout/Postings/giveout-v3')) {
             try {
                 const parsedReq = typeof reqBody === 'string' ? JSON.parse(reqBody) : reqBody;
@@ -606,7 +873,6 @@
             } catch (e) {}
         }
 
-        // Поллинг задач giveout-v2-tasks-statuses
         if (url.includes('/api2/giveout/Postings/giveout-v2-tasks-statuses')) {
             try {
                 const parsedRes = typeof resData === 'string' ? JSON.parse(resData) : resData;
@@ -628,11 +894,14 @@
             } catch (e) {}
         }
 
-        if (url.includes('/api2/giveout/Postings?sessionId=')) {
-            const match = url.match(/sessionId=(\d+)/);
+        // Универсальный перехват Postings (любой порядок параметров и регистр)
+        if (url.includes('/api2/giveout/Postings') && !url.includes('/giveout-v3') && !url.includes('/giveout-v2')) {
+            const match = url.match(/[?&]sessionId=(\d+)/i) || (getActiveSessionIdOnTab() ? [null, getActiveSessionIdOnTab()] : null);
             if (match && resData) {
-                const parsed = typeof resData === 'string' ? JSON.parse(resData) : resData;
-                handleSessionPostingsData(match[1], parsed);
+                try {
+                    const parsed = typeof resData === 'string' ? JSON.parse(resData) : resData;
+                    handleSessionPostingsData(match[1], parsed);
+                } catch(e) {}
             }
         }
 
@@ -643,14 +912,16 @@
         }
 
         if (url.includes('/api2/giveout/Sessions') && !url.includes('/close')) {
-            const parsed = typeof resData === 'string' ? JSON.parse(resData) : resData;
-            if (parsed && Array.isArray(parsed.sessions)) {
-                parsed.sessions.forEach(s => {
-                    if (s.sessionId && s.clientId) {
-                        sessionStorage.setItem('client_id_' + s.sessionId, String(s.clientId));
-                    }
-                });
-            }
+            try {
+                const parsed = typeof resData === 'string' ? JSON.parse(resData) : resData;
+                if (parsed && Array.isArray(parsed.sessions)) {
+                    parsed.sessions.forEach(s => {
+                        if (s.sessionId && s.clientId) {
+                            sessionStorage.setItem('client_id_' + s.sessionId, String(s.clientId));
+                        }
+                    });
+                }
+            } catch(e) {}
         }
     }
 
@@ -706,8 +977,10 @@
             const currentSessionId = getActiveSessionIdOnTab();
             if (!currentSessionId && activeSession) {
                 finalizeActiveSession(activeSession.sessionId, 'navigated_away');
+            } else if (currentSessionId) {
+                harvestSessionFromDOM(currentSessionId);
             }
-            setTimeout(renderBadgesInOzonUI, 400);
+            setTimeout(renderBadgesInOzonUI, 300);
         };
         const p = history.pushState, r = history.replaceState;
         history.pushState = function(...a) { p.apply(this, a); fire(); };
@@ -717,7 +990,6 @@
 
     window.addEventListener('beforeunload', () => finalizeActiveSession(null, 'tab_unloaded'));
 
-    // Перехват ввода кода руками в поисковую строку
     document.addEventListener('input', (e) => {
         if (e.target.matches('input[data-testid="searchInput"], input[placeholder*="Штрихкод"], input[placeholder*="коду"]')) {
             const val = e.target.value.trim();
@@ -774,7 +1046,8 @@
             sessionStorage.setItem('client_code_pending', barcode);
             if (activeId) {
                 storeSafePickupCode(activeId, barcode);
-                const s = await dbGet('sessions', String(activeId));
+                let s = await dbGet('sessions', String(activeId));
+                if (!s) s = await harvestSessionFromDOM(activeId);
                 if (s) {
                     s.pickupCode = barcode;
                     s.clientId = cId;
@@ -788,10 +1061,11 @@
         let currentClientName = '';
 
         if (activeId) {
-            const session = await dbGet('sessions', String(activeId));
+            let session = await dbGet('sessions', String(activeId));
+            if (!session) session = await harvestSessionFromDOM(activeId);
             if (session) {
                 currentClientName = session.clientName || '';
-                if (session.postings) {
+                if (session.postings && session.postings.length > 0) {
                     isMatchInCurrent = session.postings.some(p => {
                         const pId = String(p.id).toLowerCase();
                         const pBar = (p.barcode || '').toLowerCase();
@@ -825,119 +1099,8 @@
     }
 
     /* =========================================================================
-       7. UI & STYLES (Cyberpunk Black Glass Design)
+       7. INSPECTOR UI CONTROLS
        ========================================================================= */
-
-    const modalStyle = document.createElement('style');
-    modalStyle.innerHTML = `
-        #blackbox-modal-root {
-            position: fixed !important; top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important;
-            background: rgba(2, 6, 23, 0.85) !important;
-            backdrop-filter: blur(25px) saturate(180%) !important;
-            z-index: 10000000 !important;
-            display: flex !important; align-items: center !important; justify-content: center !important;
-            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif !important;
-            color: #f8fafc !important;
-        }
-        .bb-window {
-            width: 1140px !important; max-width: 96vw !important; height: 820px !important; max-height: 94vh !important;
-            background: #0b1120 !important; border: 1px solid rgba(255, 255, 255, 0.12) !important;
-            border-radius: 20px !important; box-shadow: 0 30px 80px rgba(0,0,0,0.8) !important;
-            display: flex !important; flex-direction: column !important; overflow: hidden !important;
-        }
-        .bb-header {
-            display: flex !important; align-items: center !important; justify-content: space-between !important;
-            padding: 16px 24px !important; border-bottom: 1px solid rgba(255, 255, 255, 0.08) !important;
-            background: rgba(255, 255, 255, 0.02) !important;
-        }
-        .bb-title { font-size: 16px !important; font-weight: 800 !important; letter-spacing: 0.5px !important; }
-        .bb-title span { color: #38bdf8 !important; }
-        .bb-tabs { display: flex !important; gap: 8px !important; }
-        .bb-tab-btn {
-            background: transparent !important; border: 1px solid transparent !important; color: #94a3b8 !important;
-            padding: 6px 14px !important; border-radius: 8px !important; font-size: 12px !important; font-weight: 600 !important;
-            cursor: pointer !important; transition: all 0.2s !important;
-        }
-        .bb-tab-btn:hover { color: #fff !important; background: rgba(255, 255, 255, 0.05) !important; }
-        .bb-tab-btn.active { color: #38bdf8 !important; background: rgba(56, 189, 248, 0.12) !important; border-color: rgba(56, 189, 248, 0.3) !important; }
-        .bb-close { color: #64748b !important; cursor: pointer !important; font-size: 20px !important; }
-        .bb-close:hover { color: #fff !important; }
-
-        .bb-body { flex: 1 1 auto !important; display: flex !important; overflow: hidden !important; }
-        .bb-main-view { flex: 1 1 auto !important; padding: 20px !important; overflow-y: auto !important; display: flex !important; flex-direction: column !important; gap: 12px !important; }
-        .bb-replay-view { width: 440px !important; min-width: 440px !important; border-left: 1px solid rgba(255, 255, 255, 0.08) !important; background: #070a12 !important; padding: 18px !important; display: flex !important; flex-direction: column !important; gap: 10px !important; overflow-y: auto !important; }
-
-        .bb-input {
-            background: rgba(255, 255, 255, 0.05) !important; border: 1px solid rgba(255, 255, 255, 0.12) !important;
-            color: #fff !important; padding: 8px 12px !important; border-radius: 8px !important; font-size: 13px !important; outline: none !important;
-        }
-        .bb-input:focus { border-color: #38bdf8 !important; }
-        .bb-btn {
-            background: #1e293b; color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); padding: 8px 14px;
-            border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.15s;
-        }
-        .bb-btn:hover { background: #0284c7; color: #fff; }
-        .bb-btn-danger { background: rgba(239, 68, 68, 0.15); color: #f87171; border-color: rgba(239, 68, 68, 0.3); }
-        .bb-btn-danger:hover { background: #ef4444; color: #fff; }
-
-        /* Всплывающие подсказки бейджей на сайте */
-        .bb-ozon-pill {
-            position: relative; font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 6px; cursor: pointer;
-            user-select: none; display: inline-flex; align-items: center; gap: 4px;
-        }
-        .bb-ozon-tooltip {
-            visibility: hidden; opacity: 0; position: absolute; bottom: 130%; left: 50%; transform: translateX(-50%);
-            width: 220px; background: #0f172a; border: 1px solid rgba(255,255,255,0.2); color: #f8fafc;
-            padding: 8px 10px; border-radius: 8px; font-size: 11px; z-index: 1000000; box-shadow: 0 10px 25px rgba(0,0,0,0.5);
-            transition: opacity 0.2s; pointer-events: none; text-align: left;
-        }
-        .bb-ozon-pill:hover .bb-ozon-tooltip { visibility: visible; opacity: 1; }
-        .bb-ozon-add-btn {
-            background: rgba(255,255,255,0.06); border: 1px dashed rgba(255,255,255,0.3); color: #94a3b8;
-            font-size: 11px; border-radius: 6px; padding: 2px 7px; cursor: pointer;
-        }
-        .bb-ozon-add-btn:hover { background: rgba(255,255,255,0.15); color: #fff; }
-
-        /* Диалог создания метки */
-        #bb-dialog-overlay {
-            position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7);
-            z-index: 20000000; display: flex; align-items: center; justify-content: center;
-        }
-        .bb-dialog {
-            background: #0f172a; border: 1px solid rgba(255,255,255,0.15); border-radius: 14px;
-            width: 420px; padding: 18px; box-shadow: 0 20px 50px rgba(0,0,0,0.8);
-        }
-
-        /* Визуальный таймлайн (Swimlanes / Gantt) */
-        .bb-gantt-day-block { display: flex; flex-direction: column; gap: 6px; margin-bottom: 20px; }
-        .bb-gantt-day-title { font-size: 13px; font-weight: 700; color: #38bdf8; display: flex; justify-content: space-between; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 6px; }
-        .bb-swimlane-row { display: flex; gap: 8px; align-items: stretch; margin-top: 4px; }
-        .bb-swimlane-track { flex: 1; display: flex; flex-direction: column; gap: 6px; background: rgba(255,255,255,0.015); border-radius: 8px; padding: 6px; border: 1px dashed rgba(255,255,255,0.05); }
-
-        .bb-session-bar {
-            background: #131d31; border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; padding: 8px 12px;
-            cursor: pointer; transition: all 0.15s; display: flex; flex-direction: column; gap: 4px; position: relative;
-        }
-        .bb-session-bar:hover { background: #1c2b46; border-color: #38bdf8; transform: translateY(-1px); }
-        .bb-session-bar.has-alien { border-left: 3px solid #ef4444 !important; }
-
-        /* Красивые виджеты БД */
-        .bb-stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
-        .bb-stat-card {
-            background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px;
-            padding: 14px; display: flex; flex-direction: column; gap: 4px;
-        }
-        .bb-stat-val { font-size: 24px; font-weight: 800; color: #f8fafc; }
-        .bb-stat-lbl { font-size: 11px; color: #94a3b8; font-weight: 600; text-transform: uppercase; }
-
-        .bb-progress-bar {
-            width: 100%; height: 8px; background: rgba(255,255,255,0.08); border-radius: 4px; overflow: hidden; margin: 8px 0;
-        }
-        .bb-progress-fill {
-            height: 100%; background: linear-gradient(90deg, #38bdf8, #818cf8); border-radius: 4px; transition: width 0.3s;
-        }
-    `;
-    document.head.appendChild(modalStyle);
 
     function toggleInspectorModal() {
         const m = document.getElementById('blackbox-modal-root');
@@ -991,20 +1154,14 @@
         renderTabContent('sessions');
     }
 
-    /* =========================================================================
-       8. TAB RENDERING & VISUAL PARALLEL TIMELINE
-       ========================================================================= */
-
     function formatDateKey(timestamp) {
         const d = new Date(timestamp);
         return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
     }
 
-    // Алгоритм распределения сессий по параллельным трекам (Swimlanes)
     function assignSwimlaneTracks(sessions) {
-        // sessions должны быть отсортированы по foundAt возрастанию
         const sorted = [...sessions].sort((a, b) => a.foundAt - b.foundAt);
-        const tracks = []; // массив времен окончания сессий для каждого трека
+        const tracks = [];
 
         return sorted.map(s => {
             let placedTrack = -1;
@@ -1030,7 +1187,6 @@
         const sidebar = document.getElementById('bb-replay-sidebar');
         if (!container) return;
 
-        // Вкладка 1: Визуальный хронограф сессий с дорожками параллельности
         if (tab === 'sessions') {
             sidebar.style.display = 'flex';
             let sessions = externalDumpData ? externalDumpData.sessions : await dbGetAll('sessions');
@@ -1054,7 +1210,6 @@
                     return;
                 }
 
-                // Группировка по дням
                 const grouped = {};
                 items.forEach(s => {
                     const key = formatDateKey(s.foundAt);
@@ -1062,7 +1217,6 @@
                     grouped[key].push(s);
                 });
 
-                // Сортировка дней по убыванию
                 Object.keys(grouped).sort((a,b) => b.localeCompare(a)).forEach(dayKey => {
                     const daySessions = grouped[dayKey];
                     const trackedSessions = assignSwimlaneTracks(daySessions);
@@ -1081,7 +1235,6 @@
                     `;
 
                     const row = dayBox.querySelector(`#tracks-container-${dayKey}`);
-                    // Создаем колонки под каждую дорожку
                     const trackCols = [];
                     for (let i = 0; i < totalTracks; i++) {
                         const col = document.createElement('div');
@@ -1091,7 +1244,6 @@
                         trackCols.push(col);
                     }
 
-                    // Раскладываем карточки по своим параллельным дорожкам
                     trackedSessions.forEach(({ session: s, trackIndex }) => {
                         const hasAlien = s.alienScans && s.alienScans.some(a => a.isRealParcel);
                         const cBadges = badgesMap.get(s.clientId) || [];
@@ -1148,7 +1300,6 @@
             shelfInp.oninput = filterGantt;
         }
 
-        // Вкладка 2: Реестр меток клиентов (CRM)
         if (tab === 'badges') {
             sidebar.style.display = 'none';
             const badgesList = await dbGetAll('client_badges');
@@ -1189,7 +1340,6 @@
             }
         }
 
-        // Вкладка 3: Поиск потеряшек (с исправленным clientName)
         if (tab === 'lookup') {
             sidebar.style.display = 'none';
             container.innerHTML = `
@@ -1234,7 +1384,6 @@
             };
         }
 
-        // Вкладка 4: Аномалии
         if (tab === 'aliens') {
             sidebar.style.display = 'none';
             const sessions = await dbGetAll('sessions');
@@ -1264,7 +1413,6 @@
             `;
         }
 
-        // Вкладка 5: База данных и статистика квоты памяти
         if (tab === 'storage') {
             sidebar.style.display = 'none';
             const sessions = await dbGetAll('sessions');
@@ -1396,7 +1544,7 @@
     }
 
     /* =========================================================================
-       9. REPLAY INSPECTOR VIEW & CRM CONTROLS
+       8. REPLAY INSPECTOR VIEW & CRM CONTROLS
        ========================================================================= */
 
     async function renderSessionReplay(session) {
@@ -1411,14 +1559,13 @@
                 <span>${session.clientName || 'Без имени'}</span>
                 ${hasCode ? `<button class="bb-btn" id="bb-reopen-order-btn" style="padding: 2px 8px; font-size: 11px;">Повторить код</button>` : ''}
             </div>
-            
+
             <div style="font-size: 11px; color: #94a3b8; display: flex; flex-direction: column; gap: 2px; margin-top: 4px;">
                 <div>Штрихкод выдачи: <b style="color: #38bdf8; font-family: monospace;">${session.pickupCode || '—'}</b></div>
                 <div>ClientId: <b>${session.clientId || '—'}</b> · Оператор: <b>${session.operator || '—'}</b></div>
                 <div>Ячейки: <b>${session.shelves || '—'}</b> · Время: <b>${session.durationSec || 0} сек</b></div>
             </div>
 
-            <!-- Бейджи клиента в Replay сайдбаре -->
             <div style="margin-top: 8px; padding: 8px; background: rgba(255,255,255,0.02); border-radius: 8px; border: 1px solid rgba(255,255,255,0.06);">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
                     <span style="font-size: 11px; font-weight: 700; color: #94a3b8;">Метки клиента:</span>
@@ -1440,7 +1587,7 @@
                     <div style="font-size: 11px; background: rgba(255,255,255,0.02); padding: 6px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.05);">
                         <div style="font-weight: 600;">${p.name}</div>
                         <div style="color: #64748b; margin-top: 2px;">
-                            ${p.barcode} · ${p.price} ₽ · 
+                            ${p.barcode} · ${p.price} ₽ ·
                             <span style="font-weight: 700; color: ${p.status === 'issued' ? '#10b981' : (p.status === 'annulated' ? '#ef4444' : '#94a3b8')}">
                                 ${p.status === 'issued' ? 'Выдан' : (p.status === 'annulated' ? 'Отказ (' + p.reasonText + ')' : 'На хранении')}
                             </span>
@@ -1486,7 +1633,7 @@
     // Инициализация
     initDB().then(() => {
         patchRoutingEvents();
-        setInterval(renderBadgesInOzonUI, 1000); // Постоянный мониторинг для динамических страниц Ozon
+        setInterval(renderBadgesInOzonUI, 1000);
     });
 
 })();
