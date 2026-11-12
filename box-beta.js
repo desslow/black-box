@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ozon BlackBox (Forensics & Audit Core)
 // @namespace    http://tampermonkey.net/
-// @version      3.5
-// @description  Ozon BlackBox: True Chrono-Timeline, Anti-Fraud Client Badges & Fixed Session Capture
+// @version      3.6
+// @description  Ozon BlackBox: Fixed DB Core, Chrono-Timeline & Anti-Fraud Badges
 // @author       desslow
 // @match        https://*.ozon.ru/*
 // @run-at       document-start
@@ -13,6 +13,7 @@
     'use strict';
 
     const DB_NAME = '_o3_telemetry_cache';
+    const DB_VERSION = 1;
     const TTL_DAYS = 180;
     const ENABLE_DEV_PURGE = true;
 
@@ -25,9 +26,10 @@
     let externalDumpData = null;
     window._ozonAuthHeaders = null;
 
+    const pendingGiveoutTasks = new Map();
     const sessionGiveoutPayloads = new Map();
-    const TAB_ID = Math.random().toString(36).slice(2, 9);
 
+    const TAB_ID = Math.random().toString(36).slice(2, 9);
     const RUS_TO_ENG = {
         'й':'q','ц':'w','у':'e','к':'r','е':'t','н':'y','г':'u','ш':'i','щ':'o','з':'p',
         'х':'[','ъ':']','ф':'a','ы':'s','в':'d','а':'f','п':'g','р':'h','о':'j','л':'k',
@@ -40,22 +42,15 @@
     }
 
     /* =========================================================================
-       1. DATABASE ARCHITECTURE (Умное авто-подключение без сброса версии)
+       1. DATABASE ARCHITECTURE (Надежное подключение на базе v2.1)
        ========================================================================= */
 
     function initDB() {
         return new Promise((resolve) => {
-            // Открываем без версии, чтобы узнать текущую в браузере и исключить VersionError
-            const checkReq = indexedDB.open(DB_NAME);
-            checkReq.onsuccess = (e) => {
-                const currentVer = e.target.result.version || 1;
-                e.target.result.close();
-
-                const targetVer = Math.max(currentVer, 2);
-                const req = indexedDB.open(DB_NAME, targetVer);
-
-                req.onupgradeneeded = (ev) => {
-                    const d = ev.target.result;
+            const connect = (ver) => {
+                const req = ver ? indexedDB.open(DB_NAME, ver) : indexedDB.open(DB_NAME);
+                req.onupgradeneeded = (e) => {
+                    const d = e.target.result;
                     if (!d.objectStoreNames.contains('sessions')) {
                         const sStore = d.createObjectStore('sessions', { keyPath: 'sessionId' });
                         sStore.createIndex('by_closedAt', 'closedAt', { unique: false });
@@ -66,22 +61,25 @@
                         scStore.createIndex('by_barcode', 'barcode', { unique: false });
                         scStore.createIndex('by_time', 'time', { unique: false });
                     }
-                    if (!d.objectStoreNames.contains('client_badges')) {
-                        d.createObjectStore('client_badges', { keyPath: 'clientId' });
-                    }
                 };
-
-                req.onsuccess = (ev) => {
-                    db = ev.target.result;
+                req.onsuccess = (e) => {
+                    db = e.target.result;
                     if (navigator.storage && navigator.storage.persist) {
                         navigator.storage.persist();
                     }
                     purgeExpiredData();
                     resolve(db);
                 };
-                req.onerror = () => resolve(null);
+                req.onerror = () => {
+                    // Если в браузере уже была создана версия выше, открываем ее авто-детектом
+                    if (req.error && req.error.name === 'VersionError') {
+                        connect(null);
+                    } else {
+                        resolve(null);
+                    }
+                };
             };
-            checkReq.onerror = () => resolve(null);
+            connect(DB_VERSION);
         });
     }
 
@@ -95,14 +93,14 @@
 
             const sIndex = sStore.index('by_closedAt');
             sIndex.openCursor(IDBKeyRange.upperBound(expireTs)).onsuccess = (e) => {
-                const c = e.target.result;
-                if (c) { sStore.delete(c.primaryKey); c.continue(); }
+                const cursor = e.target.result;
+                if (cursor) { sStore.delete(cursor.primaryKey); cursor.continue(); }
             };
 
             const scIndex = scStore.index('by_time');
             scIndex.openCursor(IDBKeyRange.upperBound(expireTs)).onsuccess = (e) => {
-                const c = e.target.result;
-                if (c) { scStore.delete(c.primaryKey); c.continue(); }
+                const cursor = e.target.result;
+                if (cursor) { scStore.delete(cursor.primaryKey); cursor.continue(); }
             };
         } catch (e) {}
     }
@@ -143,26 +141,13 @@
         });
     }
 
-    function dbDelete(storeName, key) {
-        if (!db) return Promise.resolve(false);
-        return new Promise((resolve) => {
-            try {
-                const tx = db.transaction(storeName, 'readwrite');
-                tx.objectStore(storeName).delete(key);
-                tx.oncomplete = () => resolve(true);
-                tx.onerror = () => resolve(false);
-            } catch (e) { resolve(false); }
-        });
-    }
-
     function clearEntireDB() {
         if (!db) return Promise.resolve(false);
         return new Promise((resolve) => {
             try {
-                const tx = db.transaction(['sessions', 'scans_history', 'client_badges'], 'readwrite');
+                const tx = db.transaction(['sessions', 'scans_history'], 'readwrite');
                 tx.objectStore('sessions').clear();
                 tx.objectStore('scans_history').clear();
-                tx.objectStore('client_badges').clear();
                 tx.oncomplete = () => resolve(true);
                 tx.onerror = () => resolve(false);
             } catch (e) { resolve(false); }
@@ -170,12 +155,620 @@
     }
 
     /* =========================================================================
-       2. STYLES (Тонкие темные скроллбары + Непрозрачный нативный тултип)
+       2. CLIENT BADGES ENGINE (Изолированное хранилище localStorage)
+       ========================================================================= */
+
+    const BADGES_STORAGE_KEY = '_o3_bb_badges_crm';
+
+    function getAllBadgesMap() {
+        try {
+            return JSON.parse(localStorage.getItem(BADGES_STORAGE_KEY) || '{}');
+        } catch(e) { return {}; }
+    }
+
+    function getClientBadges(clientId) {
+        if (!clientId) return [];
+        const all = getAllBadgesMap();
+        return all[String(clientId)] || [];
+    }
+
+    function addClientBadge(clientId, title, desc, color = '#ef4444') {
+        if (!clientId || !title) return;
+        const all = getAllBadgesMap();
+        const cId = String(clientId);
+        if (!all[cId]) all[cId] = [];
+
+        all[cId].push({
+            id: 'b_' + Date.now().toString(36),
+            title: title.trim(),
+            desc: desc.trim(),
+            color: color,
+            author: currentOperator || getOperatorLogin() || 'Админ'
+        });
+
+        localStorage.setItem(BADGES_STORAGE_KEY, JSON.stringify(all));
+        triggerBadgesRerender();
+    }
+
+    function removeClientBadge(clientId, badgeId) {
+        const all = getAllBadgesMap();
+        const cId = String(clientId);
+        if (!all[cId]) return;
+
+        all[cId] = all[cId].filter(b => b.id !== badgeId);
+        if (all[cId].length === 0) delete all[cId];
+
+        localStorage.setItem(BADGES_STORAGE_KEY, JSON.stringify(all));
+        triggerBadgesRerender();
+    }
+
+    function triggerBadgesRerender() {
+        const wrapper = document.getElementById('bb-ozon-injected-badges');
+        if (wrapper) wrapper.dataset.renderedKey = '';
+        renderBadgesInOzonUI();
+        const activeTab = document.querySelector('.bb-tab-btn.active')?.dataset?.tab;
+        if (activeTab === 'sessions') renderTabContent('sessions');
+        if (activeTab === 'badges') renderTabContent('badges');
+        if (activeSession) renderSessionReplay(activeSession);
+    }
+
+    function getPillClass(color) {
+        if (color === '#f59e0b') return 'bb-pill-yellow';
+        if (color === '#005bff' || color === '#3b82f6') return 'bb-pill-blue';
+        if (color === '#10b981' || color === '#00873e') return 'bb-pill-green';
+        return 'bb-pill-red';
+    }
+
+    async function renderBadgesInOzonUI() {
+        const sId = getActiveSessionIdOnTab();
+        if (!sId) return;
+
+        let session = await dbGet('sessions', sId);
+        let clientId = session?.clientId || sessionStorage.getItem('client_id_' + sId);
+        let clientName = session?.clientName || '';
+
+        const nameHeader = document.querySelector('[class*="_clientName_"]') ||
+                           document.querySelector('[class*="_client_"] [class*="heading"]') ||
+                           document.querySelector('[data-testid="client-name"]');
+        if (!nameHeader) return;
+
+        if (!clientName) {
+            clientName = nameHeader.childNodes[0]?.textContent?.trim() || 'Клиент';
+        }
+
+        const effectiveId = clientId || ('s_' + sId);
+        const badges = clientId ? getClientBadges(clientId) : [];
+        const renderKey = `${effectiveId}_${badges.length}_${badges.map(b => b.id).join(',')}`;
+
+        let badgeWrapper = nameHeader.querySelector('#bb-ozon-injected-badges');
+        if (!badgeWrapper) {
+            badgeWrapper = document.createElement('div');
+            badgeWrapper.id = 'bb-ozon-injected-badges';
+            nameHeader.appendChild(badgeWrapper);
+        }
+
+        if (badgeWrapper.dataset.renderedKey === renderKey) return;
+        badgeWrapper.dataset.renderedKey = renderKey;
+
+        badgeWrapper.innerHTML = `
+            ${badges.map(b => `
+                <div class="bb-ozon-pill ${getPillClass(b.color)}">
+                    <span>${b.title}</span>
+                    <div class="bb-ozon-tooltip">
+                        <div style="font-weight: 700; color: #001a34; margin-bottom: 4px; font-size: 13px;">${b.title}</div>
+                        <div style="color: #495867;">${b.desc || 'Нет описания инцидента'}</div>
+                        <div style="font-size: 10px; color: #8c9ba7; margin-top: 6px; border-top: 1px solid #f0f2f5; padding-top: 4px;">Автор: ${b.author}</div>
+                    </div>
+                </div>
+            `).join('')}
+            <button id="bb-add-badge-quick-btn" class="bb-ozon-add-btn" type="button" title="Добавить метку клиенту">+ Метка</button>
+        `;
+
+        badgeWrapper.querySelector('#bb-add-badge-quick-btn').onclick = (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            showCreateBadgeDialog(clientId || sId, clientName);
+        };
+    }
+
+    function showCreateBadgeDialog(clientId, clientName) {
+        const existing = document.getElementById('bb-dialog-overlay');
+        if (existing) existing.remove();
+
+        const overlay = document.createElement('div');
+        overlay.id = 'bb-dialog-overlay';
+
+        let selectedColor = '#ef4444';
+
+        overlay.innerHTML = `
+            <div class="bb-ozon-dialog">
+                <div>
+                    <h3 class="bb-dialog-title">Метка клиента</h3>
+                    <div class="bb-dialog-sub">${clientName} (ID: ${clientId})</div>
+                </div>
+
+                <input type="text" id="bb-badge-title-input" class="bb-ozon-input" placeholder="Название (например: НЕ ОПЛАТИЛ, БРАКЕР)" autofocus>
+                <textarea id="bb-badge-desc-input" class="bb-ozon-input" placeholder="Подробности (сумма долга, дата инцидента, номер заказа)..." style="height: 74px; resize: none;"></textarea>
+
+                <div>
+                    <div style="font-size: 12px; font-weight: 600; color: #707f8d; margin-bottom: 6px;">ТИП И ЦВЕТ МЕТКИ</div>
+                    <div class="bb-color-chips">
+                        <div class="bb-color-chip bb-pill-red active" data-color="#ef4444">🔴 Опасность</div>
+                        <div class="bb-color-chip bb-pill-yellow" data-color="#f59e0b">🟡 Внимание</div>
+                        <div class="bb-color-chip bb-pill-blue" data-color="#005bff">🔵 Заметка</div>
+                        <div class="bb-color-chip bb-pill-green" data-color="#10b981">🟢 Доверие</div>
+                    </div>
+                </div>
+
+                <div class="bb-dialog-actions">
+                    <button class="bb-btn-ozon-secondary" id="bb-badge-cancel" type="button">Отмена</button>
+                    <button class="bb-btn-ozon-primary" id="bb-badge-save" type="button">Сохранить метку</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(overlay);
+
+        const chips = overlay.querySelectorAll('.bb-color-chip');
+        chips.forEach(chip => {
+            chip.onclick = () => {
+                chips.forEach(c => c.classList.remove('active'));
+                chip.classList.add('active');
+                selectedColor = chip.dataset.color;
+            };
+        });
+
+        overlay.querySelector('#bb-badge-cancel').onclick = () => overlay.remove();
+        overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+
+        overlay.querySelector('#bb-badge-save').onclick = () => {
+            const title = overlay.querySelector('#bb-badge-title-input').value.trim();
+            const desc = overlay.querySelector('#bb-badge-desc-input').value.trim();
+            if (title) {
+                addClientBadge(clientId, title, desc, selectedColor);
+                overlay.remove();
+            } else {
+                overlay.querySelector('#bb-badge-title-input').focus();
+            }
+        };
+    }
+
+    /* =========================================================================
+       3. LOGIC & POSTINGS CAPTURE (Стабильная база v2.1 + Фикс оператора)
+       ========================================================================= */
+
+    function getOperatorLogin() {
+        const el = document.querySelector('[class*="_rightAvatarMenuLogin_"]');
+        if (el) currentOperator = el.textContent.trim().replace('PVZ_', '');
+        return currentOperator;
+    }
+
+    function getActiveSessionIdOnTab() {
+        return (window.location.pathname.match(/\/orders\/session(?:-new)?\/(\d+)/) || [])[1] || null;
+    }
+
+    function extractPostingDetails(p) {
+        const title = p.displayName || p.items?.[0]?.name || p.name || 'Товар';
+        let bar = p.displayBarcode1 || '';
+        if (!bar && Array.isArray(p.barcodes) && p.barcodes.length > 0) {
+            bar = p.barcodes.find(b => !b.startsWith('%')) || p.barcodes[0];
+        }
+        if (!bar && p.items?.[0]?.exemplars?.[0]?.barcodes?.[0]) {
+            bar = p.items[0].exemplars[0].barcodes[0];
+        }
+        if (!bar) bar = String(p.id);
+
+        return {
+            id: String(p.id),
+            name: title,
+            barcode: bar,
+            allBarcodes: (p.barcodes || []).map(b => String(b).toLowerCase()),
+            price: p.price || 0,
+            status: 'storage',
+            reasonText: ''
+        };
+    }
+
+    async function handleSessionPostingsData(sessionId, data) {
+        if (!data || !data.postings) return;
+        const sId = String(sessionId);
+
+        const readyPostings = (data.postings || []).filter(p => p.pvzState === 'ReadyToGiveout' || !p.pvzState);
+        currentPostingsList = readyPostings;
+
+        const clientId = data.client?.ozonClientId || data.client?.clientId || '';
+        const clientName = data.client?.clientShortName || '';
+        const shelves = Array.isArray(data.postingsShelves) ? data.postingsShelves.join(', ') : '';
+        const currentCode = sessionStorage.getItem('client_code_' + sId) || (clientId ? `${clientId}*----` : '');
+
+        // Берем логин оператора из ответа сервера Ozon, если доступен
+        const apiOp = data.employeeLogin || data.operator || data.session?.employeeLogin || null;
+
+        let session = await dbGet('sessions', sId);
+
+        if (!session) {
+            session = {
+                sessionId: sId,
+                clientId: String(clientId),
+                clientName: clientName,
+                pickupCode: currentCode,
+                foundAt: Date.now(),
+                closedAt: null,
+                durationSec: 0,
+                operator: apiOp || getOperatorLogin() || '—',
+                shelves: shelves,
+                closeReason: 'active',
+                postings: readyPostings.map(extractPostingDetails),
+                timeline: [
+                    { time: Date.now(), type: 'start', text: 'Сессия открыта' }
+                ],
+                alienScans: [],
+                tabId: TAB_ID
+            };
+        } else {
+            if (clientId) session.clientId = String(clientId);
+            if (clientName) session.clientName = clientName;
+            if (shelves) session.shelves = shelves;
+            if (currentCode && !currentCode.includes('----')) session.pickupCode = currentCode;
+            if (apiOp && (!session.operator || session.operator === '—')) session.operator = apiOp;
+            if (!session.postings || session.postings.length === 0) {
+                session.postings = readyPostings.map(extractPostingDetails);
+            }
+        }
+
+        activeSession = session;
+        await dbPut('sessions', session);
+        setTimeout(renderBadgesInOzonUI, 200);
+    }
+
+    async function recordTimelineEvent(sId, type, text, isAlien = false, extraData = {}) {
+        const targetId = sId ? String(sId) : (activeSession ? activeSession.sessionId : null);
+        if (!targetId) return;
+
+        const session = await dbGet('sessions', targetId);
+        if (!session) return;
+
+        const ev = { time: Date.now(), type, text, isAlien, ...extraData };
+        session.timeline.push(ev);
+        if (isAlien) session.alienScans.push(ev);
+        activeSession = session;
+        await dbPut('sessions', session);
+    }
+
+    async function finalizeActiveSession(sId, reason = 'completed') {
+        const targetId = sId ? String(sId) : (activeSession ? activeSession.sessionId : getActiveSessionIdOnTab());
+        if (!targetId) return;
+
+        const session = await dbGet('sessions', String(targetId));
+        if (!session || session.closedAt) return;
+
+        session.closedAt = Date.now();
+        session.durationSec = Math.max(1, Math.round((session.closedAt - session.foundAt) / 1000));
+        session.closeReason = reason;
+
+        let issuedCount = 0;
+        let annulatedCount = 0;
+        let storageCount = 0;
+
+        const apiGiveoutData = sessionGiveoutPayloads.get(String(targetId));
+
+        session.postings.forEach(pObj => {
+            const pIdStr = String(pObj.id);
+            if (apiGiveoutData && apiGiveoutData.has(pIdStr)) {
+                const itemMeta = apiGiveoutData.get(pIdStr);
+                if (itemMeta.isReturn) {
+                    pObj.status = 'annulated';
+                    pObj.reasonText = itemMeta.reasonId ? `Причина #${itemMeta.reasonId}` : 'Отказ клиента';
+                    annulatedCount++;
+                } else {
+                    pObj.status = 'issued';
+                    issuedCount++;
+                }
+            } else {
+                if (reason === 'completed') {
+                    pObj.status = 'issued';
+                    issuedCount++;
+                } else {
+                    pObj.status = 'storage';
+                    storageCount++;
+                }
+            }
+        });
+
+        let summaryText = 'Сессия завершена';
+        if (reason === 'manual_dock') summaryText = 'Закрыто вручную через Dock';
+        else if (reason === 'manual_back') summaryText = 'Выход назад на /orders';
+        else if (reason === 'tab_unloaded') summaryText = 'Вкладка закрыта/обновлена';
+
+        summaryText += ` (Выдано: ${issuedCount}, Отказ: ${annulatedCount}, Хранение: ${storageCount})`;
+        session.timeline.push({ time: Date.now(), type: 'finish', text: summaryText });
+
+        await dbPut('sessions', session);
+        sessionGiveoutPayloads.delete(String(targetId));
+
+        if (activeSession && String(activeSession.sessionId) === String(targetId)) {
+            activeSession = null;
+        }
+    }
+
+    async function verifyOzonArticle(barcode) {
+        try {
+            const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json, text/plain, */*' };
+            if (window._ozonAuthHeaders) Object.assign(headers, window._ozonAuthHeaders);
+
+            const res = await fetch('https://turbo-pvz.ozon.ru/p-api/article-tracking/Entity/Find', {
+                method: 'POST',
+                headers: headers,
+                body: JSON.stringify({ isManualInput: false, name: barcode }),
+                credentials: 'same-origin'
+            });
+            if (res.ok) {
+                const data = await res.json();
+                if (data.entity && data.entity.id) {
+                    return { isOzonArticle: true, name: data.entity.name || '' };
+                }
+            }
+        } catch (e) {}
+        return { isOzonArticle: false };
+    }
+
+    function captureAuthToken(headersObj) {
+        if (!headersObj) return;
+        try {
+            const auth = headersObj.get ? headersObj.get('authorization') : headersObj['authorization'] || headersObj['Authorization'];
+            if (auth) {
+                window._ozonAuthHeaders = {
+                    'authorization': auth,
+                    'x-o3-app-name': (headersObj.get ? headersObj.get('x-o3-app-name') : headersObj['x-o3-app-name']) || 'turbo-pvz-ui',
+                    'x-o3-app-version': (headersObj.get ? headersObj.get('x-o3-app-version') : headersObj['x-o3-app-version']) || '',
+                    'x-o3-version-name': (headersObj.get ? headersObj.get('x-o3-version-name') : headersObj['x-o3-version-name']) || ''
+                };
+            }
+        } catch (e) {}
+    }
+
+    /* =========================================================================
+       4. NETWORK INTERCEPTOR (Fetch & XHR)
+       ========================================================================= */
+
+    function interceptPayload(url, reqBody, resData, status = 200) {
+        if (url.includes('/by-code') || url.includes('/find')) {
+            try {
+                const parsedReq = typeof reqBody === 'string' ? JSON.parse(reqBody) : reqBody;
+                const code = parsedReq?.code || parsedReq?.searchString;
+                if (code && /^\d{5,12}\*\d{3,6}$/.test(code)) {
+                    sessionStorage.setItem('client_code_pending', code);
+                }
+            } catch(e) {}
+        }
+
+        if (url.includes('/api2/giveout/Sessions/close')) {
+            let closedId = null;
+            if (typeof reqBody === 'string') {
+                try { closedId = JSON.parse(reqBody).sessionId; } catch (e) {}
+            } else if (reqBody && reqBody.sessionId) {
+                closedId = reqBody.sessionId;
+            }
+            finalizeActiveSession(closedId, 'completed');
+        }
+
+        // Перехват giveout-v3
+        if (url.includes('/api2/giveout/Postings/giveout-v3')) {
+            try {
+                const parsedReq = typeof reqBody === 'string' ? JSON.parse(reqBody) : reqBody;
+                if (parsedReq && parsedReq.sessionId) {
+                    const sId = String(parsedReq.sessionId);
+                    const postingsMap = new Map();
+
+                    (parsedReq.postings || []).forEach(p => {
+                        const isReturn = Boolean(p.returnReasonId !== null && p.returnReasonId !== undefined) || (p.returnExemplars && p.returnExemplars.length > 0);
+                        postingsMap.set(String(p.id), {
+                            isReturn,
+                            reasonId: p.returnReasonId
+                        });
+                    });
+
+                    sessionGiveoutPayloads.set(sId, postingsMap);
+                    finalizeActiveSession(sId, 'completed');
+                }
+            } catch (e) {}
+        }
+
+        // Перехват загрузки товаров
+        if (url.includes('/api2/giveout/Postings') && !url.includes('/giveout-v3') && !url.includes('/giveout-v2')) {
+            const match = url.match(/[?&]sessionId=(\d+)/i) || url.match(/sessionId=(\d+)/);
+            if (match && resData) {
+                const parsed = typeof resData === 'string' ? JSON.parse(resData) : resData;
+                handleSessionPostingsData(match[1], parsed);
+            }
+        }
+
+        if (url.includes('/Payment') || url.includes('/pay')) {
+            if (status >= 400) {
+                recordTimelineEvent(null, 'payment_failed', '❌ ОШИБКА ОПЛАТЫ ЗАКАЗА', true);
+            }
+        }
+
+        if (url.includes('/api2/giveout/Sessions') && !url.includes('/close')) {
+            const parsed = typeof resData === 'string' ? JSON.parse(resData) : resData;
+            if (parsed && Array.isArray(parsed.sessions)) {
+                parsed.sessions.forEach(s => {
+                    if (s.sessionId && s.clientId) {
+                        sessionStorage.setItem('client_id_' + s.sessionId, String(s.clientId));
+                    }
+                });
+            }
+        }
+    }
+
+    const origOpen = XMLHttpRequest.prototype.open;
+    const origSend = XMLHttpRequest.prototype.send;
+    const origSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+
+    XMLHttpRequest.prototype.open = function(method, url) {
+        this._bUrl = typeof url === 'string' ? url : '';
+        this._bHeaders = {};
+        return origOpen.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+        if (this._bHeaders) this._bHeaders[name.toLowerCase()] = value;
+        return origSetRequestHeader.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.send = function(body) {
+        if (this._bHeaders) captureAuthToken(this._bHeaders);
+        const self = this;
+        this.addEventListener('load', function() {
+            try {
+                interceptPayload(self._bUrl, body, self.responseText, self.status);
+            } catch (e) {}
+        });
+        return origSend.apply(this, arguments);
+    };
+
+    const origFetch = window.fetch;
+    window.fetch = async function(...args) {
+        try {
+            if (args[1]?.headers) captureAuthToken(new Headers(args[1].headers));
+        } catch (e) {}
+
+        const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+        const response = await origFetch.apply(this, args);
+
+        try {
+            const reqBody = args[1]?.body;
+            response.clone().text().then(resText => {
+                interceptPayload(url, reqBody, resText, response.status);
+            }).catch(() => {});
+        } catch (e) {}
+
+        return response;
+    };
+
+    /* =========================================================================
+       5. SCANNER HOOK
+       ========================================================================= */
+
+    window.addEventListener('beforeunload', () => finalizeActiveSession(null, 'tab_unloaded'));
+
+    document.addEventListener('click', (e) => {
+        if (e.target.closest('.apple-close-btn')) {
+            const card = e.target.closest('.apple-session-card');
+            const sId = card?.dataset?.sessionId;
+            if (sId) finalizeActiveSession(sId, 'manual_dock');
+        }
+        if (e.target.closest('button') && e.target.closest('button').querySelector('path[d^="M6.293 2.293"]')) {
+            finalizeActiveSession(null, 'manual_back');
+        }
+    }, true);
+
+    document.addEventListener('input', (e) => {
+        if (e.target.matches('input[data-testid="searchInput"], input[placeholder*="Штрихкод"], input[placeholder*="коду"]')) {
+            const val = e.target.value.trim();
+            if (/^\d{5,12}\*\d{3,6}$/.test(val)) {
+                sessionStorage.setItem('client_code_pending', val);
+                const aId = getActiveSessionIdOnTab();
+                if (aId) sessionStorage.setItem('client_code_' + aId, val);
+            }
+        }
+    }, true);
+
+    window.addEventListener('keydown', function(e) {
+        if (e.ctrlKey && e.shiftKey && e.altKey && e.code === 'KeyB') {
+            e.preventDefault();
+            e.stopPropagation();
+            toggleInspectorModal();
+            return;
+        }
+
+        if (e.key === 'Escape') {
+            const modal = document.getElementById('blackbox-modal-root');
+            if (modal) {
+                e.preventDefault();
+                closeInspectorModal();
+                return;
+            }
+        }
+
+        const now = Date.now();
+        if (now - lastScanTime > 150) scanBuffer = '';
+        lastScanTime = now;
+
+        if (e.key === 'Enter') {
+            const raw = scanBuffer.trim();
+            scanBuffer = '';
+            if (raw.length >= 4) {
+                processBarcodeScan(translit(raw));
+            }
+        } else if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
+            scanBuffer += e.key;
+        }
+    }, true);
+
+    async function processBarcodeScan(barcode) {
+        const clean = barcode.toLowerCase();
+        const now = Date.now();
+        const activeId = getActiveSessionIdOnTab();
+
+        const isClientBarcode = /^\d{5,12}\*\d{3,6}$/.test(clean);
+        if (isClientBarcode) {
+            const parts = clean.split('*');
+            const cId = parts[0];
+            sessionStorage.setItem('client_code_pending', barcode);
+            if (activeId) {
+                sessionStorage.setItem('client_code_' + activeId, barcode);
+                const s = await dbGet('sessions', String(activeId));
+                if (s) {
+                    s.pickupCode = barcode;
+                    s.clientId = cId;
+                    await dbPut('sessions', s);
+                }
+            }
+            return;
+        }
+
+        let isMatchInCurrent = false;
+
+        if (activeId) {
+            const session = await dbGet('sessions', String(activeId));
+            if (session && session.postings) {
+                isMatchInCurrent = session.postings.some(p => {
+                    const pId = String(p.id).toLowerCase();
+                    const pBar = (p.barcode || '').toLowerCase();
+                    const bList = (p.allBarcodes || []).map(b => String(b).toLowerCase());
+                    return pId.includes(clean) || clean.includes(pId) || pBar.includes(clean) || clean.includes(pBar) || bList.some(b => b.includes(clean));
+                });
+
+                if (isMatchInCurrent) {
+                    recordTimelineEvent(activeId, 'scan', `Отсканирован товар: ${barcode}`, false, { barcode });
+                } else {
+                    verifyOzonArticle(barcode).then(res => {
+                        if (res.isOzonArticle) {
+                            recordTimelineEvent(activeId, 'alien_scan', `⚠️ ЧУЖОЙ ТОВАР СО СКЛАДА: ${barcode} (${res.name})`, true, { barcode, isRealParcel: true });
+                        } else {
+                            recordTimelineEvent(activeId, 'junk_scan', `ℹ️ Служебный ШК: ${barcode}`, false, { barcode, isRealParcel: false });
+                        }
+                    });
+                }
+            }
+        }
+
+        dbPut('scans_history', {
+            barcode: barcode,
+            sessionId: activeId,
+            operator: activeSession?.operator || getOperatorLogin() || '—',
+            time: now,
+            isAlien: activeId ? !isMatchInCurrent : false
+        });
+    }
+
+    /* =========================================================================
+       6. STYLES (Custom Slim Scrollbars + Opaque Native Tooltip)
        ========================================================================= */
 
     const unifiedStyle = document.createElement('style');
     unifiedStyle.innerHTML = `
-        /* ---------------- ТЕМНЫЕ СКРОЛЛБАРЫ ---------------- */
+        /* ---------------- КАСТОМНЫЕ ТЕМНЫЕ СКРОЛЛБАРЫ ---------------- */
         #blackbox-modal-root *::-webkit-scrollbar {
             width: 6px !important;
             height: 6px !important;
@@ -378,7 +971,7 @@
         .bb-btn-danger { background: rgba(239, 68, 68, 0.15); color: #f87171; border-color: rgba(239, 68, 68, 0.3); }
         .bb-btn-danger:hover { background: #ef4444; color: #fff; }
 
-        /* ---------------- НАСТОЯЩИЙ ПОСЕКУНДНЫЙ ТАЙМЛАЙН ---------------- */
+        /* ---------------- ХРОНОГРАФ СМЕНЫ (ЧЕТКИЙ ВЕРТИКАЛЬНЫЙ ТАЙМЛАЙН) ---------------- */
         .bb-chrono-day { display: flex; flex-direction: column; gap: 8px; margin-bottom: 24px; }
         .bb-chrono-day-title {
             font-size: 13px; font-weight: 800; color: #38bdf8; display: flex; justify-content: space-between;
@@ -410,579 +1003,7 @@
     document.head.appendChild(unifiedStyle);
 
     /* =========================================================================
-       3. CLIENT BADGES ENGINE (CRM & Anti-Fraud)
-       ========================================================================= */
-
-    function getPillClass(color) {
-        if (color === '#f59e0b') return 'bb-pill-yellow';
-        if (color === '#005bff' || color === '#3b82f6') return 'bb-pill-blue';
-        if (color === '#10b981' || color === '#00873e') return 'bb-pill-green';
-        return 'bb-pill-red';
-    }
-
-    async function getClientBadges(clientId) {
-        if (!clientId) return [];
-        const record = await dbGet('client_badges', String(clientId));
-        return record ? record.badges || [] : [];
-    }
-
-    async function addClientBadge(clientId, title, desc, color = '#ef4444') {
-        if (!clientId || !title) return;
-        const cId = String(clientId);
-        let record = await dbGet('client_badges', cId);
-        if (!record) record = { clientId: cId, badges: [] };
-
-        const newBadge = {
-            id: 'b_' + Date.now().toString(36),
-            title: title.trim(),
-            desc: desc.trim(),
-            color: color,
-            createdAt: Date.now(),
-            author: currentOperator || getOperatorLogin() || 'Админ'
-        };
-
-        record.badges.push(newBadge);
-        await dbPut('client_badges', record);
-        triggerBadgesRerender();
-    }
-
-    async function removeClientBadge(clientId, badgeId) {
-        if (!clientId || !badgeId) return;
-        const cId = String(clientId);
-        let record = await dbGet('client_badges', cId);
-        if (!record) return;
-
-        record.badges = record.badges.filter(b => b.id !== badgeId);
-        if (record.badges.length === 0) {
-            await dbDelete('client_badges', cId);
-        } else {
-            await dbPut('client_badges', record);
-        }
-        triggerBadgesRerender();
-    }
-
-    function triggerBadgesRerender() {
-        const wrapper = document.getElementById('bb-ozon-injected-badges');
-        if (wrapper) wrapper.dataset.renderedKey = '';
-        renderBadgesInOzonUI();
-        const activeTab = document.querySelector('.bb-tab-btn.active')?.dataset?.tab;
-        if (activeTab === 'sessions') renderTabContent('sessions');
-        if (activeTab === 'badges') renderTabContent('badges');
-        if (activeSession) renderSessionReplay(activeSession);
-    }
-
-    async function renderBadgesInOzonUI() {
-        const sId = getActiveSessionIdOnTab();
-        if (!sId) return;
-
-        let session = await dbGet('sessions', sId);
-        let clientId = session?.clientId || activeSession?.clientId || sessionStorage.getItem('client_id_' + sId);
-        let clientName = session?.clientName || activeSession?.clientName || '';
-
-        const nameHeader = document.querySelector('[class*="_clientName_"]') ||
-                           document.querySelector('[class*="_client_"] [class*="heading"]') ||
-                           document.querySelector('[data-testid="client-name"]');
-        if (!nameHeader) return;
-
-        if (!clientName) {
-            clientName = nameHeader.childNodes[0]?.textContent?.trim() || 'Клиент';
-        }
-
-        const effectiveId = clientId || ('s_' + sId);
-        const badges = clientId ? await getClientBadges(clientId) : [];
-        const renderKey = `${effectiveId}_${badges.length}_${badges.map(b => b.id).join(',')}`;
-
-        let badgeWrapper = nameHeader.querySelector('#bb-ozon-injected-badges');
-        if (!badgeWrapper) {
-            badgeWrapper = document.createElement('div');
-            badgeWrapper.id = 'bb-ozon-injected-badges';
-            nameHeader.appendChild(badgeWrapper);
-        }
-
-        if (badgeWrapper.dataset.renderedKey === renderKey) return;
-        badgeWrapper.dataset.renderedKey = renderKey;
-
-        badgeWrapper.innerHTML = `
-            ${badges.map(b => `
-                <div class="bb-ozon-pill ${getPillClass(b.color)}">
-                    <span>${b.title}</span>
-                    <div class="bb-ozon-tooltip">
-                        <div style="font-weight: 700; color: #001a34; margin-bottom: 4px; font-size: 13px;">${b.title}</div>
-                        <div style="color: #495867;">${b.desc || 'Нет описания инцидента'}</div>
-                        <div style="font-size: 10px; color: #8c9ba7; margin-top: 6px; border-top: 1px solid #f0f2f5; padding-top: 4px;">Автор: ${b.author}</div>
-                    </div>
-                </div>
-            `).join('')}
-            <button id="bb-add-badge-quick-btn" class="bb-ozon-add-btn" type="button" title="Добавить служебную метку клиенту">+ Метка</button>
-        `;
-
-        badgeWrapper.querySelector('#bb-add-badge-quick-btn').onclick = (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            showCreateBadgeDialog(clientId || sId, clientName);
-        };
-    }
-
-    function showCreateBadgeDialog(clientId, clientName) {
-        const existing = document.getElementById('bb-dialog-overlay');
-        if (existing) existing.remove();
-
-        const overlay = document.createElement('div');
-        overlay.id = 'bb-dialog-overlay';
-
-        let selectedColor = '#ef4444';
-
-        overlay.innerHTML = `
-            <div class="bb-ozon-dialog">
-                <div>
-                    <h3 class="bb-dialog-title">Метка клиента</h3>
-                    <div class="bb-dialog-sub">${clientName} (ID: ${clientId})</div>
-                </div>
-
-                <input type="text" id="bb-badge-title-input" class="bb-ozon-input" placeholder="Название (например: НЕ ОПЛАТИЛ, БРАКЕР)" autofocus>
-                <textarea id="bb-badge-desc-input" class="bb-ozon-input" placeholder="Подробности (сумма долга, дата инцидента, номер заказа)..." style="height: 74px; resize: none;"></textarea>
-
-                <div>
-                    <div style="font-size: 12px; font-weight: 600; color: #707f8d; margin-bottom: 6px;">ТИП И ЦВЕТ МЕТКИ</div>
-                    <div class="bb-color-chips">
-                        <div class="bb-color-chip bb-pill-red active" data-color="#ef4444">🔴 Опасность</div>
-                        <div class="bb-color-chip bb-pill-yellow" data-color="#f59e0b">🟡 Внимание</div>
-                        <div class="bb-color-chip bb-pill-blue" data-color="#005bff">🔵 Заметка</div>
-                        <div class="bb-color-chip bb-pill-green" data-color="#10b981">🟢 Доверие</div>
-                    </div>
-                </div>
-
-                <div class="bb-dialog-actions">
-                    <button class="bb-btn-ozon-secondary" id="bb-badge-cancel" type="button">Отмена</button>
-                    <button class="bb-btn-ozon-primary" id="bb-badge-save" type="button">Сохранить метку</button>
-                </div>
-            </div>
-        `;
-        document.body.appendChild(overlay);
-
-        const chips = overlay.querySelectorAll('.bb-color-chip');
-        chips.forEach(chip => {
-            chip.onclick = () => {
-                chips.forEach(c => c.classList.remove('active'));
-                chip.classList.add('active');
-                selectedColor = chip.dataset.color;
-            };
-        });
-
-        overlay.querySelector('#bb-badge-cancel').onclick = () => overlay.remove();
-        overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
-
-        overlay.querySelector('#bb-badge-save').onclick = async () => {
-            const title = overlay.querySelector('#bb-badge-title-input').value.trim();
-            const desc = overlay.querySelector('#bb-badge-desc-input').value.trim();
-            if (title) {
-                await addClientBadge(clientId, title, desc, selectedColor);
-                overlay.remove();
-            } else {
-                overlay.querySelector('#bb-badge-title-input').focus();
-            }
-        };
-    }
-
-    /* =========================================================================
-       4. CODE CAPTURE & SAFE SESSION STORAGE
-       ========================================================================= */
-
-    function getOperatorLogin() {
-        const el = document.querySelector('[class*="_rightAvatarMenuLogin_"]');
-        if (el) currentOperator = el.textContent.trim().replace('PVZ_', '');
-        return currentOperator;
-    }
-
-    function getActiveSessionIdOnTab() {
-        return (window.location.pathname.match(/\/orders\/session(?:-new)?\/(\d+)/) || [])[1] || null;
-    }
-
-    function storeSafePickupCode(sId, code) {
-        if (!code || code.includes('----')) return;
-        sessionStorage.setItem('client_code_' + sId, code);
-        if (activeSession && String(activeSession.sessionId) === String(sId)) {
-            activeSession.pickupCode = code;
-        }
-    }
-
-    function extractPostingDetails(p) {
-        const title = p.displayName || p.items?.[0]?.name || p.name || 'Товар';
-        let bar = p.displayBarcode1 || '';
-        if (!bar && Array.isArray(p.barcodes) && p.barcodes.length > 0) {
-            bar = p.barcodes.find(b => !b.startsWith('%')) || p.barcodes[0];
-        }
-        if (!bar && p.items?.[0]?.exemplars?.[0]?.barcodes?.[0]) {
-            bar = p.items[0].exemplars[0].barcodes[0];
-        }
-        if (!bar) bar = String(p.id);
-
-        return {
-            id: String(p.id),
-            name: title,
-            barcode: bar,
-            allBarcodes: (p.barcodes || []).map(b => String(b).toLowerCase()),
-            price: p.price || 0,
-            status: 'storage',
-            reasonText: ''
-        };
-    }
-
-    async function handleSessionPostingsData(sessionId, data) {
-        if (!data || !data.postings) return;
-        const sId = String(sessionId);
-
-        const readyPostings = (data.postings || []).filter(p => p.pvzState === 'ReadyToGiveout' || !p.pvzState);
-        currentPostingsList = readyPostings;
-
-        const clientId = data.client?.ozonClientId || data.client?.clientId || '';
-        const clientName = data.client?.clientShortName || '';
-        const shelves = Array.isArray(data.postingsShelves) ? data.postingsShelves.join(', ') : '';
-        const apiOperator = data.employeeLogin || data.operator || data.session?.employeeLogin || null;
-
-        let currentCode = sessionStorage.getItem('client_code_' + sId) || (clientId ? `${clientId}*----` : '');
-
-        let session = await dbGet('sessions', sId);
-
-        if (!session) {
-            session = {
-                sessionId: sId,
-                clientId: String(clientId),
-                clientName: clientName,
-                pickupCode: currentCode,
-                foundAt: Date.now(),
-                closedAt: null,
-                durationSec: 0,
-                operator: apiOperator || getOperatorLogin() || '—',
-                shelves: shelves,
-                closeReason: 'active',
-                postings: readyPostings.map(extractPostingDetails),
-                timeline: [
-                    { time: Date.now(), type: 'start', text: 'Сессия открыта' }
-                ],
-                alienScans: [],
-                tabId: TAB_ID
-            };
-        } else {
-            if (clientId) session.clientId = String(clientId);
-            if (clientName) session.clientName = clientName;
-            if (shelves) session.shelves = shelves;
-            if (currentCode && !currentCode.includes('----')) session.pickupCode = currentCode;
-            if (apiOperator && (!session.operator || session.operator === '—')) session.operator = apiOperator;
-            if (!session.postings || session.postings.length === 0) {
-                session.postings = readyPostings.map(extractPostingDetails);
-            }
-        }
-
-        activeSession = session;
-        await dbPut('sessions', session);
-        setTimeout(renderBadgesInOzonUI, 200);
-    }
-
-    async function recordTimelineEvent(sId, type, text, isAlien = false, extraData = {}) {
-        const targetId = sId ? String(sId) : (activeSession ? activeSession.sessionId : null);
-        if (!targetId) return;
-
-        const session = await dbGet('sessions', targetId);
-        if (!session) return;
-
-        const ev = { time: Date.now(), type, text, isAlien, ...extraData };
-        session.timeline.push(ev);
-        if (isAlien) session.alienScans.push(ev);
-        activeSession = session;
-        await dbPut('sessions', session);
-    }
-
-    async function finalizeActiveSession(sId, reason = 'completed') {
-        const targetId = sId ? String(sId) : (activeSession ? activeSession.sessionId : getActiveSessionIdOnTab());
-        if (!targetId) return;
-
-        const session = await dbGet('sessions', String(targetId));
-        if (!session || session.closedAt) return;
-
-        session.closedAt = Date.now();
-        session.durationSec = Math.max(1, Math.round((session.closedAt - session.foundAt) / 1000));
-        session.closeReason = reason;
-
-        let issuedCount = 0;
-        let annulatedCount = 0;
-        let storageCount = 0;
-
-        const apiGiveoutData = sessionGiveoutPayloads.get(String(targetId));
-
-        session.postings.forEach(pObj => {
-            const pIdStr = String(pObj.id);
-            if (apiGiveoutData && apiGiveoutData.has(pIdStr)) {
-                const itemMeta = apiGiveoutData.get(pIdStr);
-                if (itemMeta.isReturn) {
-                    pObj.status = 'annulated';
-                    pObj.reasonText = itemMeta.reasonId ? `Причина #${itemMeta.reasonId}` : 'Отказ клиента';
-                    annulatedCount++;
-                } else {
-                    pObj.status = 'issued';
-                    issuedCount++;
-                }
-            } else {
-                if (reason === 'completed') {
-                    pObj.status = 'issued';
-                    issuedCount++;
-                } else {
-                    pObj.status = 'storage';
-                    storageCount++;
-                }
-            }
-        });
-
-        let summaryText = 'Сессия завершена';
-        if (reason === 'manual_dock') summaryText = 'Закрыто вручную через Dock';
-        else if (reason === 'manual_back') summaryText = 'Выход назад на /orders';
-        else if (reason === 'tab_unloaded') summaryText = 'Вкладка закрыта/обновлена';
-
-        summaryText += ` (Выдано: ${issuedCount}, Отказ: ${annulatedCount}, Хранение: ${storageCount})`;
-        session.timeline.push({ time: Date.now(), type: 'finish', text: summaryText });
-
-        await dbPut('sessions', session);
-        sessionGiveoutPayloads.delete(String(targetId));
-
-        if (activeSession && String(activeSession.sessionId) === String(targetId)) {
-            activeSession = null;
-        }
-    }
-
-    /* =========================================================================
-       5. NETWORK INTERCEPTOR (Fetch & XHR)
-       ========================================================================= */
-
-    function captureAuthToken(headersObj) {
-        if (!headersObj) return;
-        try {
-            const auth = headersObj.get ? headersObj.get('authorization') : headersObj['authorization'] || headersObj['Authorization'];
-            if (auth) {
-                window._ozonAuthHeaders = {
-                    'authorization': auth,
-                    'x-o3-app-name': (headersObj.get ? headersObj.get('x-o3-app-name') : headersObj['x-o3-app-name']) || 'turbo-pvz-ui',
-                    'x-o3-app-version': (headersObj.get ? headersObj.get('x-o3-app-version') : headersObj['x-o3-app-version']) || '',
-                    'x-o3-version-name': (headersObj.get ? headersObj.get('x-o3-version-name') : headersObj['x-o3-version-name']) || ''
-                };
-            }
-        } catch (e) {}
-    }
-
-    function interceptPayload(url, reqBody, resData, status = 200) {
-        if (url.includes('/by-code') || url.includes('/find')) {
-            try {
-                const parsedReq = typeof reqBody === 'string' ? JSON.parse(reqBody) : reqBody;
-                const code = parsedReq?.code || parsedReq?.searchString;
-                if (code && /^\d{5,12}\*\d{3,6}$/.test(code)) {
-                    sessionStorage.setItem('client_code_pending', code);
-                }
-            } catch(e) {}
-        }
-
-        if (url.includes('/api2/giveout/Sessions/close')) {
-            let closedId = null;
-            if (typeof reqBody === 'string') {
-                try { closedId = JSON.parse(reqBody).sessionId; } catch (e) {}
-            } else if (reqBody && reqBody.sessionId) {
-                closedId = reqBody.sessionId;
-            }
-            finalizeActiveSession(closedId, 'completed');
-        }
-
-        // МГНОВЕННЫЙ ПЕРЕХВАТ ВЫДАЧИ
-        if (url.includes('/api2/giveout/Postings/giveout-v3')) {
-            try {
-                const parsedReq = typeof reqBody === 'string' ? JSON.parse(reqBody) : reqBody;
-                if (parsedReq && parsedReq.sessionId) {
-                    const sId = String(parsedReq.sessionId);
-                    const postingsMap = new Map();
-
-                    (parsedReq.postings || []).forEach(p => {
-                        const isReturn = Boolean(p.returnReasonId !== null && p.returnReasonId !== undefined) || (p.returnExemplars && p.returnExemplars.length > 0);
-                        postingsMap.set(String(p.id), { isReturn, reasonId: p.returnReasonId });
-                    });
-
-                    sessionGiveoutPayloads.set(sId, postingsMap);
-                    finalizeActiveSession(sId, 'completed');
-                }
-            } catch (e) {}
-        }
-
-        if (url.includes('/api2/giveout/Postings') && !url.includes('/giveout-v3') && !url.includes('/giveout-v2')) {
-            const match = url.match(/[?&]sessionId=(\d+)/i) || (getActiveSessionIdOnTab() ? [null, getActiveSessionIdOnTab()] : null);
-            if (match && resData) {
-                try {
-                    const parsed = typeof resData === 'string' ? JSON.parse(resData) : resData;
-                    handleSessionPostingsData(match[1], parsed);
-                } catch(e) {}
-            }
-        }
-
-        if (url.includes('/Payment') || url.includes('/pay')) {
-            if (status >= 400) {
-                recordTimelineEvent(null, 'payment_failed', '❌ ОШИБКА ОПЛАТЫ ЗАКАЗА', true);
-            }
-        }
-
-        if (url.includes('/api2/giveout/Sessions') && !url.includes('/close')) {
-            try {
-                const parsed = typeof resData === 'string' ? JSON.parse(resData) : resData;
-                if (parsed && Array.isArray(parsed.sessions)) {
-                    parsed.sessions.forEach(s => {
-                        if (s.sessionId && s.clientId) {
-                            sessionStorage.setItem('client_id_' + s.sessionId, String(s.clientId));
-                        }
-                    });
-                }
-            } catch(e) {}
-        }
-    }
-
-    const origOpen = XMLHttpRequest.prototype.open;
-    const origSend = XMLHttpRequest.prototype.send;
-    const origSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
-
-    XMLHttpRequest.prototype.open = function(method, url) {
-        this._bUrl = typeof url === 'string' ? url : '';
-        this._bHeaders = {};
-        return origOpen.apply(this, arguments);
-    };
-
-    XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
-        if (this._bHeaders) this._bHeaders[name.toLowerCase()] = value;
-        return origSetRequestHeader.apply(this, arguments);
-    };
-
-    XMLHttpRequest.prototype.send = function(body) {
-        if (this._bHeaders) captureAuthToken(this._bHeaders);
-        const self = this;
-        this.addEventListener('load', function() {
-            try { interceptPayload(self._bUrl, body, self.responseText, self.status); } catch (e) {}
-        });
-        return origSend.apply(this, arguments);
-    };
-
-    const origFetch = window.fetch;
-    window.fetch = async function(...args) {
-        try {
-            if (args[1]?.headers) captureAuthToken(new Headers(args[1].headers));
-        } catch (e) {}
-
-        const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
-        const response = await origFetch.apply(this, args);
-
-        try {
-            const reqBody = args[1]?.body;
-            response.clone().text().then(resText => {
-                interceptPayload(url, reqBody, resText, response.status);
-            }).catch(() => {});
-        } catch (e) {}
-
-        return response;
-    };
-
-    /* =========================================================================
-       6. SPA ROUTING & SCANNER HOOK
-       ========================================================================= */
-
-    window.addEventListener('beforeunload', () => finalizeActiveSession(null, 'tab_unloaded'));
-
-    document.addEventListener('input', (e) => {
-        if (e.target.matches('input[data-testid="searchInput"], input[placeholder*="Штрихкод"], input[placeholder*="коду"]')) {
-            const val = e.target.value.trim();
-            if (/^\d{5,12}\*\d{3,6}$/.test(val)) {
-                sessionStorage.setItem('client_code_pending', val);
-                const aId = getActiveSessionIdOnTab();
-                if (aId) storeSafePickupCode(aId, val);
-            }
-        }
-    }, true);
-
-    window.addEventListener('keydown', function(e) {
-        if (e.ctrlKey && e.shiftKey && e.altKey && e.code === 'KeyB') {
-            e.preventDefault();
-            e.stopPropagation();
-            toggleInspectorModal();
-            return;
-        }
-
-        if (e.key === 'Escape') {
-            const modal = document.getElementById('blackbox-modal-root');
-            if (modal) {
-                e.preventDefault();
-                closeInspectorModal();
-                return;
-            }
-        }
-
-        const now = Date.now();
-        if (now - lastScanTime > 150) scanBuffer = '';
-        lastScanTime = now;
-
-        if (e.key === 'Enter') {
-            const raw = scanBuffer.trim();
-            scanBuffer = '';
-            if (raw.length >= 4) {
-                processBarcodeScan(translit(raw));
-            }
-        } else if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
-            scanBuffer += e.key;
-        }
-    }, true);
-
-    async function processBarcodeScan(barcode) {
-        const clean = barcode.toLowerCase();
-        const now = Date.now();
-        const activeId = getActiveSessionIdOnTab();
-
-        const isClientBarcode = /^\d{5,12}\*\d{3,6}$/.test(clean);
-        if (isClientBarcode) {
-            const parts = clean.split('*');
-            const cId = parts[0];
-            sessionStorage.setItem('client_code_pending', barcode);
-            if (activeId) {
-                storeSafePickupCode(activeId, barcode);
-                const s = await dbGet('sessions', String(activeId));
-                if (s) {
-                    s.pickupCode = barcode;
-                    s.clientId = cId;
-                    await dbPut('sessions', s);
-                }
-            }
-            return;
-        }
-
-        let isMatchInCurrent = false;
-
-        if (activeId) {
-            const session = await dbGet('sessions', String(activeId));
-            if (session && session.postings) {
-                isMatchInCurrent = session.postings.some(p => {
-                    const pId = String(p.id).toLowerCase();
-                    const pBar = (p.barcode || '').toLowerCase();
-                    const bList = (p.allBarcodes || []).map(b => String(b).toLowerCase());
-                    return pId.includes(clean) || clean.includes(pId) || pBar.includes(clean) || clean.includes(pBar) || bList.some(b => b.includes(clean));
-                });
-
-                if (isMatchInCurrent) {
-                    recordTimelineEvent(activeId, 'scan', `Отсканирован товар: ${barcode}`, false, { barcode });
-                } else {
-                    recordTimelineEvent(activeId, 'alien_scan', `⚠️ Не принадлежит заказу: ${barcode}`, true, { barcode });
-                }
-            }
-        }
-
-        dbPut('scans_history', {
-            barcode: barcode,
-            sessionId: activeId,
-            operator: activeSession?.operator || getOperatorLogin() || '—',
-            time: now,
-            isAlien: activeId ? !isMatchInCurrent : false
-        });
-    }
-
-    /* =========================================================================
-       7. INSPECTOR UI CONTROLS & CHRONO-TIMELINE
+       7. INSPECTOR UI CONTROLS
        ========================================================================= */
 
     function toggleInspectorModal() {
@@ -1050,10 +1071,6 @@
         if (tab === 'sessions') {
             sidebar.style.display = 'flex';
             let sessions = externalDumpData ? externalDumpData.sessions : await dbGetAll('sessions');
-            const allBadges = await dbGetAll('client_badges');
-            const badgesMap = new Map(allBadges.map(b => [b.clientId, b.badges]));
-
-            // Сортируем: новые сверху
             sessions.sort((a, b) => b.foundAt - a.foundAt);
 
             container.innerHTML = `
@@ -1073,7 +1090,6 @@
                     return;
                 }
 
-                // Группировка по дням
                 const grouped = {};
                 items.forEach((s, idx) => {
                     const key = formatDateKey(s.foundAt);
@@ -1099,9 +1115,8 @@
 
                     dayItems.forEach(({ s, idx }) => {
                         const hasAlien = s.alienScans && s.alienScans.length > 0;
-                        const cBadges = badgesMap.get(s.clientId) || [];
+                        const cBadges = getClientBadges(s.clientId);
 
-                        // Проверка на пересечение по времени (параллельность)
                         const parallelWith = items.find((other, oIdx) => {
                             if (oIdx === idx || !s.closedAt || !other.closedAt) return false;
                             return (s.foundAt <= other.closedAt && (s.closedAt || s.foundAt) >= other.foundAt);
@@ -1168,7 +1183,8 @@
 
         if (tab === 'badges') {
             sidebar.style.display = 'none';
-            const badgesList = await dbGetAll('client_badges');
+            const allBadges = getAllBadgesMap();
+            const clientIds = Object.keys(allBadges);
 
             container.innerHTML = `
                 <div style="font-size: 13px; color: #94a3b8; margin-bottom: 8px;">Реестр персональных меток и черного списка клиентов:</div>
@@ -1176,18 +1192,18 @@
             `;
 
             const bTable = container.querySelector('#bb-badges-table');
-            if (badgesList.length === 0) {
+            if (clientIds.length === 0) {
                 bTable.innerHTML = '<div style="color: #64748b; padding: 20px; text-align: center;">Нет созданных меток</div>';
             } else {
-                bTable.innerHTML = badgesList.map(item => `
+                bTable.innerHTML = clientIds.map(cId => `
                     <div style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 12px; display: flex; justify-content: space-between; align-items: center;">
                         <div style="display: flex; flex-direction: column; gap: 4px;">
-                            <div style="font-weight: 700; font-size: 14px;">ClientId: ${item.clientId}</div>
+                            <div style="font-weight: 700; font-size: 14px;">ClientId: ${cId}</div>
                             <div style="display: flex; gap: 6px; flex-wrap: wrap;">
-                                ${(item.badges || []).map(b => `
+                                ${(allBadges[cId] || []).map(b => `
                                     <div style="background: ${b.color}22; border: 1px solid ${b.color}; color: ${b.color}; border-radius: 6px; padding: 3px 8px; font-size: 11px;">
                                         <b>${b.title}</b> — ${b.desc} <span style="opacity: 0.6;">(${b.author})</span>
-                                        <span class="bb-del-badge-btn" data-cid="${item.clientId}" data-bid="${b.id}" style="margin-left: 6px; cursor: pointer;">✕</span>
+                                        <span class="bb-del-badge-btn" data-cid="${cId}" data-bid="${b.id}" style="margin-left: 6px; cursor: pointer;">✕</span>
                                     </div>
                                 `).join('')}
                             </div>
@@ -1196,8 +1212,8 @@
                 `).join('');
 
                 bTable.querySelectorAll('.bb-del-badge-btn').forEach(btn => {
-                    btn.onclick = async () => {
-                        await removeClientBadge(btn.dataset.cid, btn.dataset.bid);
+                    btn.onclick = () => {
+                        removeClientBadge(btn.dataset.cid, btn.dataset.bid);
                         renderTabContent('badges');
                     };
                 });
@@ -1356,7 +1372,7 @@
 
             if (ENABLE_DEV_PURGE) {
                 container.querySelector('#bb-purge-btn').onclick = async () => {
-                    if (confirm('Стереть абсолютно ВСЕ сессии, сканы и метки клиентов?')) {
+                    if (confirm('Стереть абсолютно ВСЕ сессии и сканы?')) {
                         await clearEntireDB();
                         renderTabContent('storage');
                     }
@@ -1384,7 +1400,7 @@
         const sidebar = document.getElementById('bb-replay-sidebar');
         if (!sidebar) return;
 
-        const badges = await getClientBadges(session.clientId);
+        const badges = getClientBadges(session.clientId);
         const hasCode = session.pickupCode && !session.pickupCode.includes('----');
 
         sidebar.innerHTML = `
