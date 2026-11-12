@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ozon BlackBox
 // @namespace    http://tampermonkey.net/
-// @version      5.0
-// @description  Ozon BlackBox 5.0 - Inbound Tracking, Multi-PVZ Network, Lazy Tree & Realtime Tags
+// @version      5.1
+// @description  Ozon BlackBox 5.1 - Realtime Tags, Device Health, Remote Alerts & Inbound Relay
 // @author       desslow
 // @match        https://*.ozon.ru/*
 // @run-at       document-start
@@ -13,20 +13,19 @@
 (function() {
     'use strict';
 
-    const SUPABASE_URL = 'https://prsstkodpfugnyazrxrp.supabase.co';
+    const SUPABASE_URL = '';
     const SUPABASE_KEY = '';
     const PVZ_LIST = ['PVZ_2210', 'PVZ_2379', 'PVZ_3021', 'PVZ_3228', 'PVZ_3239'];
 
     function getPvzId() {
         let saved = localStorage.getItem('bb_current_pvz');
         if (!saved || !PVZ_LIST.includes(saved)) {
-            saved = prompt(`[BlackBox 5.0] Выберите текущий ПВЗ для этого ПК:\n${PVZ_LIST.join(', ')}`, PVZ_LIST[0]);
+            saved = prompt(`[BlackBox 5.1] Выберите ПВЗ для этого ПК:\n${PVZ_LIST.join(', ')}`, PVZ_LIST[0]);
             if (!PVZ_LIST.includes(saved)) saved = PVZ_LIST[0];
             localStorage.setItem('bb_current_pvz', saved);
         }
         return saved;
     }
-
     const CURRENT_PVZ = getPvzId();
 
     function getDeviceId() {
@@ -55,11 +54,10 @@
     window._ozonAuthHeaders = null;
 
     let currentSortOrder = 'desc';
-
     const postingsInboundCache = new Map();
-
     const pendingGiveoutTasks = new Map();
     const sessionGiveoutPayloads = new Map();
+    const dismissedAlerts = new Set();
 
     const TAB_ID = Math.random().toString(36).slice(2, 9);
     const RUS_TO_ENG = {
@@ -73,6 +71,7 @@
         return str.split('').map(ch => RUS_TO_ENG[ch.toLowerCase()] || ch).join('');
     }
 
+    // ================= SUPABASE CLIENT =================
     function supabaseReq(endpoint, method = 'GET', body = null) {
         return new Promise((resolve) => {
             GM_xmlhttpRequest({
@@ -153,7 +152,89 @@
         supabaseReq('client_tags?on_conflict=client_id', 'POST', payload);
     }
 
-    // ================= INDEXEDDB CORE =================
+    // Телеметрия дисков и статуса
+    async function sendDeviceHeartbeat() {
+        let usageMb = 0, quotaMb = 0, percent = 0;
+        if (navigator.storage && navigator.storage.estimate) {
+            try {
+                const est = await navigator.storage.estimate();
+                usageMb = Number((est.usage / (1024 * 1024)).toFixed(2));
+                quotaMb = Number((est.quota / (1024 * 1024)).toFixed(2));
+                percent = Number(Math.min(100, (est.usage / est.quota) * 100).toFixed(2));
+            } catch (e) {}
+        }
+
+        const payload = {
+            device_id: DEVICE_ID,
+            pvz_id: CURRENT_PVZ,
+            current_operator: getOperatorLogin() || 'Не авторизован',
+            disk_usage_mb: usageMb,
+            disk_quota_mb: quotaMb,
+            disk_percent: percent,
+            tab_id: TAB_ID,
+            last_seen_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+        };
+        supabaseReq('devices?on_conflict=device_id', 'POST', payload);
+    }
+
+    function recordInboundRelay(barcode, cell, op) {
+        const payload = {
+            pvz_id: CURRENT_PVZ,
+            barcode: barcode || '—',
+            cell: cell || '—',
+            operator: op || getOperatorLogin() || 'Склад',
+            time: Date.now()
+        };
+        supabaseReq('inbounds', 'POST', payload);
+    }
+
+    async function checkRemoteAlerts() {
+        const query = `alerts?is_active=eq.true&or=(target_scope.eq.ALL,and(target_scope.eq.PVZ,target_value.eq.${CURRENT_PVZ}),and(target_scope.eq.DEVICE,target_value.eq.${DEVICE_ID}))`;
+        const alerts = await supabaseReq(query, 'GET');
+        if (Array.isArray(alerts) && alerts.length > 0) {
+            for (let a of alerts) {
+                if (!dismissedAlerts.has(a.id)) {
+                    renderOzonNativeAlert(a);
+                    break;
+                }
+            }
+        }
+    }
+
+    function renderOzonNativeAlert(alertObj) {
+        if (document.getElementById(`bb-alert-${alertObj.id}`)) return;
+
+        let container = document.getElementById('ozi-notifications-container');
+        if (!container) {
+            container = document.createElement('div');
+            container.id = 'ozi-notifications-container';
+            container.style.cssText = 'position: fixed; top: 16px; right: 20px; z-index: 9999999; display: flex; flex-direction: column; gap: 8px; pointer-events: none;';
+            document.body.appendChild(container);
+        }
+
+        const toast = document.createElement('div');
+        toast.id = `bb-alert-${alertObj.id}`;
+        toast.style.pointerEvents = 'auto';
+        toast.innerHTML = `
+            <div style="background: #1e293b; color: #fff; border: 1px solid #ef4444; border-radius: 12px; padding: 12px 16px; display: flex; align-items: flex-start; gap: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.6); max-width: 380px;">
+                <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="#ef4444" style="flex-shrink:0; margin-top: 2px;"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
+                <div style="flex: 1;">
+                    <div style="font-weight: 800; font-size: 13px; color: #f87171; margin-bottom: 2px;">${alertObj.title}</div>
+                    <div style="font-size: 12px; color: #e2e8f0; line-height: 1.3;">${alertObj.message}</div>
+                </div>
+                <svg id="bb-close-alert-btn" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="cursor: pointer; flex-shrink: 0;"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+            </div>
+        `;
+        container.appendChild(toast);
+
+        toast.querySelector('#bb-close-alert-btn').onclick = () => {
+            dismissedAlerts.add(alertObj.id);
+            toast.remove();
+        };
+    }
+
+    // ================= INDEXEDDB SETUP =================
     function initDB() {
         return new Promise((resolve, reject) => {
             const req = indexedDB.open(DB_NAME, DB_VERSION);
@@ -178,6 +259,7 @@
                 if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
                 purgeExpiredData();
                 cloudSyncTagsPull();
+                sendDeviceHeartbeat();
                 resolve(db);
             };
             req.onerror = () => reject(req.error);
@@ -303,204 +385,18 @@
             price: p.price || 0,
             status: 'storage',
             reasonText: '',
-            inbound: null 
+            inbound: null
         };
     }
 
-    async function fetchPostingInboundHistory(postingId) {
-        if (!postingId || postingsInboundCache.has(String(postingId))) {
-            return postingsInboundCache.get(String(postingId));
+    // Парсер приемки товара из сетевых ответов
+    function parseAndRecordInboundNetwork(data) {
+        if (!data) return;
+        let address = data.articlePositions?.[0]?.address || data.state?.address || data.article?.address || data.address || '';
+        let barcode = data.articlePositions?.[0]?.barcode || data.state?.barcode || data.article?.barcode || data.barcode || '';
+        if (barcode && address) {
+            recordInboundRelay(barcode, address, getOperatorLogin());
         }
-
-        try {
-            const headers = { 'Accept': 'application/json', 'Content-Type': 'application/json' };
-            if (window._ozonAuthHeaders) Object.assign(headers, window._ozonAuthHeaders);
-
-            const res = await fetch(`https://turbo-pvz.ozon.ru/api2/article-tracking/Entity/operation-history-v2?entityId=${postingId}&entityType=Article&entitySubType=ArticlePosting`, {
-                headers, credentials: 'same-origin'
-            });
-
-            if (res.ok) {
-                const data = await res.json();
-                const inboundInfo = extractPlacementFromHistory(data);
-                if (inboundInfo) {
-                    postingsInboundCache.set(String(postingId), inboundInfo);
-                    return inboundInfo;
-                }
-            }
-        } catch (e) {}
-        return null;
-    }
-
-    function extractPlacementFromHistory(historyData) {
-        if (!historyData || !Array.isArray(historyData.operationSteps)) return null;
-
-        for (let step of historyData.operationSteps) {
-            if (step.operationStepType === 'OnStore' && Array.isArray(step.operations)) {
-                for (let opGroup of step.operations) {
-                    if (Array.isArray(opGroup)) {
-                        for (let op of opGroup) {
-                            if (op.description && op.description.includes('Разместили')) {
-                                const d = new Date(op.momentUtc);
-                                const timeStr = `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`;
-                                return {
-                                    text: op.description.replace('Разместили в ячейку', 'Ячейка').replace('Разместили', 'Размещен').trim(),
-                                    time: timeStr,
-                                    operator: (op.userName || '').replace('PVZ_', '').trim() || 'Склад'
-                                };
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return null;
-    }
-
-    async function handleSessionPostingsData(sessionId, data) {
-        if (!data || !data.postings) return;
-        const sId = String(sessionId);
-        const readyPostings = (data.postings || []).filter(p => p.pvzState === 'ReadyToGiveout' || !p.pvzState);
-        currentPostingsList = readyPostings;
-
-        const clientId = data.client?.ozonClientId || data.client?.clientId || '';
-        const clientName = data.client?.clientShortName || '';
-        const shelves = Array.isArray(data.postingsShelves) ? data.postingsShelves.join(', ') : '';
-
-        if (clientId) {
-            sessionStorage.setItem('client_id_' + sId, String(clientId));
-            const pendingCode = sessionStorage.getItem('client_code_pending');
-            if (pendingCode && pendingCode.startsWith(String(clientId))) {
-                sessionStorage.setItem('client_code_' + sId, pendingCode);
-                sessionStorage.removeItem('client_code_pending');
-            }
-        }
-
-        let session = await dbGet('sessions', sId);
-
-        let realCode = sessionStorage.getItem('client_code_' + sId) || sessionStorage.getItem('client_code_pending');
-        if (realCode) sessionStorage.removeItem('client_code_pending');
-        if (!realCode && session && session.pickupCode && !session.pickupCode.includes('----')) {
-            realCode = session.pickupCode;
-        }
-        const currentCode = realCode || (clientId ? `${clientId}*----` : '');
-        const apiOperator = sessionStorage.getItem('session_operator_' + sId) || '';
-
-        const postingsList = readyPostings.map(extractPostingDetails);
-
-        if (!session) {
-            session = {
-                sessionId: sId, clientId: String(clientId), clientName: clientName, pickupCode: currentCode,
-                foundAt: Date.now(), closedAt: null, durationSec: 0,
-                operator: apiOperator || getOperatorLogin(),
-                shelves: shelves, closeReason: 'active', postings: postingsList,
-                timeline: [{ time: Date.now(), type: 'start', text: 'Сессия открыта' }],
-                alienScans: [], tabId: TAB_ID, pvzId: CURRENT_PVZ
-            };
-        } else {
-            if (clientId) session.clientId = String(clientId);
-            if (clientName) session.clientName = clientName;
-            if (shelves) session.shelves = shelves;
-            if (currentCode && !currentCode.includes('----')) session.pickupCode = currentCode;
-            if (apiOperator) session.operator = apiOperator;
-            if (!session.postings || session.postings.length === 0) session.postings = postingsList;
-        }
-
-        activeSession = session;
-        await dbPut('sessions', session);
-        cloudSyncSession(session);
-
-        // В фоне подтягиваем историю приемки для каждого товара
-        session.postings.forEach(p => {
-            fetchPostingInboundHistory(p.id).then(inbound => {
-                if (inbound) {
-                    p.inbound = inbound;
-                    dbPut('sessions', session);
-                }
-            });
-        });
-    }
-
-    async function recordTimelineEvent(sId, type, text, isAlien = false, extraData = {}) {
-        const targetId = sId ? String(sId) : (activeSession ? activeSession.sessionId : null);
-        if (!targetId) return;
-        const session = await dbGet('sessions', targetId);
-        if (!session) return;
-
-        const ev = { time: Date.now(), type, text, isAlien, ...extraData };
-        session.timeline.push(ev);
-        if (isAlien) session.alienScans.push(ev);
-        activeSession = session;
-        await dbPut('sessions', session);
-        cloudSyncSession(session);
-    }
-
-    async function finalizeActiveSession(sId, reason = 'completed') {
-        const targetId = sId ? String(sId) : (activeSession ? activeSession.sessionId : getActiveSessionIdOnTab());
-        if (!targetId) return;
-
-        const session = await dbGet('sessions', String(targetId));
-        if (!session || session.closedAt) return;
-
-        session.closedAt = Date.now();
-        session.durationSec = Math.max(1, Math.round((session.closedAt - session.foundAt) / 1000));
-
-        const apiOperator = sessionStorage.getItem('session_operator_' + targetId);
-        if (apiOperator) session.operator = apiOperator;
-
-        session.closeReason = reason;
-
-        let issuedCount = 0, annulatedCount = 0, storageCount = 0;
-        const apiGiveoutData = sessionGiveoutPayloads.get(String(targetId));
-
-        session.postings.forEach(pObj => {
-            const pIdStr = String(pObj.id);
-            if (apiGiveoutData && apiGiveoutData.has(pIdStr)) {
-                const itemMeta = apiGiveoutData.get(pIdStr);
-                if (itemMeta.isReturn) { pObj.status = 'annulated'; pObj.reasonText = itemMeta.reasonId ? `Причина #${itemMeta.reasonId}` : 'Отказ клиента'; annulatedCount++; }
-                else { pObj.status = 'issued'; issuedCount++; }
-            } else {
-                const cardWrapper = document.querySelector(`[data-testid="${pObj.id}"]`);
-                if (cardWrapper) {
-                    const txt = cardWrapper.textContent;
-                    if (txt.includes('К выдаче') && !txt.includes('К аннуляции') && !txt.includes('Отказ')) { pObj.status = 'issued'; issuedCount++; }
-                    else if (txt.includes('К аннуляции') || txt.includes('Отказ')) { pObj.status = 'annulated'; pObj.reasonText = 'Отказ'; annulatedCount++; }
-                    else { pObj.status = 'storage'; storageCount++; }
-                } else {
-                    if (reason === 'completed' && apiGiveoutData) { pObj.status = 'storage'; storageCount++; }
-                    else if (reason === 'completed') { pObj.status = 'issued'; issuedCount++; }
-                    else { pObj.status = 'storage'; storageCount++; }
-                }
-            }
-        });
-
-        let summaryText = 'Сессия завершена';
-        if (reason === 'manual_dock') summaryText = 'Закрыто вручную через Dock';
-        else if (reason === 'manual_back') summaryText = 'Выход назад на /orders';
-        else if (reason === 'tab_unloaded') summaryText = 'Вкладка закрыта/обновлена';
-        else if (reason === 'payment_failed') summaryText = 'Сбой оплаты заказа';
-
-        summaryText += ` (Выдано: ${issuedCount}, Отказ: ${annulatedCount}, Хранение: ${storageCount})`;
-        session.timeline.push({ time: Date.now(), type: 'finish', text: summaryText });
-        await dbPut('sessions', session);
-        sessionGiveoutPayloads.delete(String(targetId));
-
-        cloudSyncSession(session);
-
-        if (activeSession && String(activeSession.sessionId) === String(targetId)) activeSession = null;
-    }
-
-    async function verifyOzonArticle(barcode) {
-        try {
-            const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json, text/plain, */*' };
-            if (window._ozonAuthHeaders) Object.assign(headers, window._ozonAuthHeaders);
-            const res = await fetch('https://turbo-pvz.ozon.ru/p-api/article-tracking/Entity/Find', { method: 'POST', headers: headers, body: JSON.stringify({ isManualInput: false, name: barcode }), credentials: 'same-origin' });
-            if (res.ok) {
-                const data = await res.json();
-                if (data.entity && data.entity.id) return { isOzonArticle: true, name: data.entity.name || '' };
-            }
-        } catch (e) {}
-        return { isOzonArticle: false };
     }
 
     function captureAuthToken(headersObj) {
@@ -519,6 +415,10 @@
     }
 
     function interceptPayload(url, reqBody, resData, status = 200) {
+        if (url.includes('/Movement/put') || url.includes('/clearing/articles/receive') || url.includes('/Resolver/GetResolveEntity')) {
+            try { parseAndRecordInboundNetwork(typeof resData === 'string' ? JSON.parse(resData) : resData); } catch (e) {}
+        }
+
         if (url.includes('/api2/giveout/Sessions/close')) {
             let closedId = null;
             if (typeof reqBody === 'string') { try { closedId = JSON.parse(reqBody).sessionId; } catch (e) {} } else if (reqBody && reqBody.sessionId) closedId = reqBody.sessionId;
@@ -553,9 +453,9 @@
                         if (st.status === 'Processed' && pendingGiveoutTasks.has(tId)) {
                             const taskInfo = pendingGiveoutTasks.get(tId);
                             pendingGiveoutTasks.delete(tId);
-                            let hasActiveTasksForSession = false;
-                            for (let entry of pendingGiveoutTasks.values()) { if (entry.sessionId === taskInfo.sessionId) { hasActiveTasksForSession = true; break; } }
-                            if (!hasActiveTasksForSession) finalizeActiveSession(taskInfo.sessionId, 'completed');
+                            let hasActiveTasks = false;
+                            for (let entry of pendingGiveoutTasks.values()) { if (entry.sessionId === taskInfo.sessionId) { hasActiveTasks = true; break; } }
+                            if (!hasActiveTasks) finalizeActiveSession(taskInfo.sessionId, 'completed');
                         }
                     });
                 }
@@ -570,10 +470,6 @@
             }
         }
 
-        if (url.includes('/api2/giveout/Payment') || url.includes('/api2/giveout/Sessions/pay')) {
-            if (status >= 400) recordTimelineEvent(null, 'payment_failed', '❌ ОШИБКА ПРОВЕДЕНИЯ ОПЛАТЫ', true);
-        }
-
         if (url.includes('/api2/giveout/Sessions') && !url.includes('/close')) {
             const parsed = typeof resData === 'string' ? JSON.parse(resData) : resData;
             if (parsed && Array.isArray(parsed.sessions)) {
@@ -581,39 +477,11 @@
                     const sId = String(s.sessionId);
                     const realOp = (s.userName || '').replace('PVZ_', '').trim();
                     if (realOp) sessionStorage.setItem('session_operator_' + sId, realOp);
-
                     if (s.clientId) sessionStorage.setItem('client_id_' + sId, String(s.clientId));
-
                     const code = s.clientBarcode || s.verifyCode || s.code || s.pickupCode;
-                    if (code && typeof code === 'string' && !code.includes('----')) {
-                        sessionStorage.setItem('client_code_' + sId, code);
-                    }
-
-                    dbGet('sessions', sId).then(cached => {
-                        if (cached) {
-                            let updated = false;
-                            if (realOp && cached.operator !== realOp) { cached.operator = realOp; updated = true; }
-                            if (code && !code.includes('----') && cached.pickupCode !== code) { cached.pickupCode = code; updated = true; }
-                            if (updated) {
-                                dbPut('sessions', cached);
-                                cloudSyncSession(cached);
-                            }
-                        }
-                    });
+                    if (code && typeof code === 'string' && !code.includes('----')) sessionStorage.setItem('client_code_' + sId, code);
                 });
             }
-        }
-
-        // Перехват ответов истории для кэша
-        if (url.includes('/operation-history-v2')) {
-            try {
-                const m = url.match(/entityId=(\d+)/);
-                if (m && resData) {
-                    const parsed = typeof resData === 'string' ? JSON.parse(resData) : resData;
-                    const inbound = extractPlacementFromHistory(parsed);
-                    if (inbound) postingsInboundCache.set(String(m[1]), inbound);
-                }
-            } catch (e) {}
         }
     }
 
@@ -642,203 +510,65 @@
         return response;
     };
 
-    window.addEventListener('beforeunload', () => finalizeActiveSession(null, 'tab_unloaded'));
-    document.addEventListener('click', (e) => {
-        if (e.target.closest('.apple-close-btn')) { const card = e.target.closest('.apple-session-card'); const sId = card?.dataset?.sessionId; if (sId) finalizeActiveSession(sId, 'manual_dock'); }
-        if (e.target.closest('button') && e.target.closest('button').querySelector('path[d^="M6.293 2.293"]')) finalizeActiveSession(null, 'manual_back');
-    }, true);
+    async function handleSessionPostingsData(sessionId, data) {
+        if (!data || !data.postings) return;
+        const sId = String(sessionId);
+        const readyPostings = (data.postings || []).filter(p => p.pvzState === 'ReadyToGiveout' || !p.pvzState);
+        currentPostingsList = readyPostings;
 
-    window.addEventListener('keydown', function(e) {
-        if (e.ctrlKey && e.shiftKey && e.altKey && e.code === 'KeyB') { e.preventDefault(); e.stopPropagation(); toggleInspectorModal(); return; }
-        if (e.key === 'Escape') {
-            const tModal = document.getElementById('bb-tag-creator-modal');
-            if (tModal) { e.preventDefault(); e.stopPropagation(); tModal.remove(); return; }
-            const modal = document.getElementById('blackbox-modal-root');
-            if (modal) { e.preventDefault(); e.stopPropagation(); closeInspectorModal(); return; }
-        }
+        const clientId = data.client?.ozonClientId || data.client?.clientId || '';
+        const clientName = data.client?.clientShortName || '';
+        const shelves = Array.isArray(data.postingsShelves) ? data.postingsShelves.join(', ') : '';
 
-        const now = Date.now();
-        if (now - lastScanTime > 150) scanBuffer = '';
-        lastScanTime = now;
+        if (clientId) sessionStorage.setItem('client_id_' + sId, String(clientId));
 
-        if (e.key === 'Enter') {
-            const raw = scanBuffer.trim();
-            scanBuffer = '';
-            if (raw.length >= 4) processBarcodeScan(translit(raw));
-        } else if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
-            scanBuffer += e.key;
-        }
-    }, true);
+        let session = await dbGet('sessions', sId);
+        let realCode = sessionStorage.getItem('client_code_' + sId) || (session && session.pickupCode && !session.pickupCode.includes('----') ? session.pickupCode : '');
+        const currentCode = realCode || (clientId ? `${clientId}*----` : '');
+        const apiOperator = sessionStorage.getItem('session_operator_' + sId) || '';
 
-    async function processBarcodeScan(barcode) {
-        const clean = barcode.toLowerCase();
-        const now = Date.now();
-        const activeId = getActiveSessionIdOnTab();
-        const currentOp = (activeId && sessionStorage.getItem('session_operator_' + activeId)) || getOperatorLogin();
-        let currentClientName = '';
+        const postingsList = readyPostings.map(extractPostingDetails);
 
-        const isClientBarcode = /^\d{5,12}\*\d{3,6}$/.test(clean);
-        if (isClientBarcode) {
-            const parts = clean.split('*');
-            const cId = parts[0];
-            sessionStorage.setItem('client_code_pending', barcode);
-            if (activeId) {
-                sessionStorage.setItem('client_code_' + activeId, barcode);
-                const s = await dbGet('sessions', String(activeId));
-                if (s) {
-                    s.pickupCode = barcode;
-                    s.clientId = cId;
-                    await dbPut('sessions', s);
-                    cloudSyncSession(s);
-                }
-            }
-            return;
-        }
-
-        let isMatchInCurrent = false;
-        if (activeId) {
-            const session = await dbGet('sessions', String(activeId));
-            if (session) {
-                currentClientName = session.clientName || 'Без имени';
-                if (session.postings) {
-                    isMatchInCurrent = session.postings.some(p => {
-                        const pId = String(p.id).toLowerCase();
-                        const pBar = (p.barcode || '').toLowerCase();
-                        const bList = (p.allBarcodes || []).map(b => String(b).toLowerCase());
-                        return pId.includes(clean) || clean.includes(pId) || pBar.includes(clean) || clean.includes(pBar) || bList.some(b => b.includes(clean));
-                    });
-
-                    if (isMatchInCurrent) recordTimelineEvent(activeId, 'scan', `Отсканирован товар: ${barcode}`, false, { barcode });
-                    else {
-                        verifyOzonArticle(barcode).then(res => {
-                            if (res.isOzonArticle) recordTimelineEvent(activeId, 'alien_scan', `⚠️ ЧУЖОЙ ТОВАР СО СКЛАДА: ${barcode} (${res.name})`, true, { barcode, isRealParcel: true });
-                            else recordTimelineEvent(activeId, 'junk_scan', `ℹ️ Служебный/Внешний ШК: ${barcode}`, false, { barcode, isRealParcel: false });
-                        });
-                    }
-                }
-            }
-        }
-
-        const scanRecord = {
-            barcode: barcode, sessionId: activeId, operator: currentOp, clientName: currentClientName, time: now, isAlien: activeId ? !isMatchInCurrent : false
-        };
-        dbPut('scans_history', scanRecord);
-        cloudSyncScan(scanRecord);
-    }
-
-    function openTagCreatorModal(clientId, onCreated) {
-        let ex = document.getElementById('bb-tag-creator-modal');
-        if (ex) ex.remove();
-
-        const activeId = getActiveSessionIdOnTab();
-        const currentOp = (activeId && sessionStorage.getItem('session_operator_' + activeId)) || getOperatorLogin() || 'Оператор';
-
-        const modal = document.createElement('div');
-        modal.id = 'bb-tag-creator-modal';
-        modal.innerHTML = `
-            <div class="bb-tag-dialog">
-                <div class="bb-tag-dialog-head">
-                    <span>Метка для клиента: <b>#${clientId}</b></span>
-                    <span class="bb-tag-dialog-close" id="bb-tag-cancel">✕</span>
-                </div>
-                <div class="bb-tag-dialog-body">
-                    <label class="bb-tag-label">Название метки</label>
-                    <input type="text" class="bb-input" id="bb-tag-title-inp" placeholder="..." autofocus>
-
-                    <label class="bb-tag-label">Описание</label>
-                    <textarea class="bb-input" id="bb-tag-desc-inp" rows="2" placeholder="Заметка операторам при выдаче..."></textarea>
-
-                    <label class="bb-tag-label">Цвет</label>
-                    <div class="bb-tag-colors">
-                        <label class="bb-color-opt"><input type="radio" name="tagColor" value="purple" checked><span class="bb-color-dot" style="background: #a855f7;"></span><span>Фиолетовый</span></label>
-                        <label class="bb-color-opt"><input type="radio" name="tagColor" value="amber"><span class="bb-color-dot" style="background: #f59e0b;"></span><span>Оранжевый</span></label>
-                        <label class="bb-color-opt"><input type="radio" name="tagColor" value="red"><span class="bb-color-dot" style="background: #ef4444;"></span><span>Красный</span></label>
-                        <label class="bb-color-opt"><input type="radio" name="tagColor" value="emerald"><span class="bb-color-dot" style="background: #10b981;"></span><span>Зеленый</span></label>
-                    </div>
-                </div>
-                <div class="bb-tag-dialog-foot">
-                    <button class="bb-btn-save-tag" id="bb-tag-save-btn">Сохранить</button>
-                </div>
-            </div>
-        `;
-        document.body.appendChild(modal);
-
-        modal.querySelector('#bb-tag-cancel').onclick = () => modal.remove();
-        modal.querySelector('#bb-tag-save-btn').onclick = async () => {
-            const title = modal.querySelector('#bb-tag-title-inp').value.trim();
-            const desc = modal.querySelector('#bb-tag-desc-inp').value.trim();
-            const color = modal.querySelector('input[name="tagColor"]:checked').value;
-
-            if (!title) {
-                modal.querySelector('#bb-tag-title-inp').focus();
-                return;
-            }
-
-            const tagObj = { title, desc, color, author: currentOp, date: Date.now() };
-            await addClientTag(clientId, tagObj);
-            modal.remove();
-            if (onCreated) onCreated();
-        };
-    }
-
-    function injectDomTags() {
-        if (!window.location.pathname.includes('/orders/session')) return;
-        const activeId = getActiveSessionIdOnTab();
-        if (!activeId) return;
-
-        const nameEl = document.querySelector('[class*="_clientName_"]');
-        if (!nameEl) return;
-
-        let wrap = nameEl.parentElement.querySelector('.bb-client-tags-wrap');
-        if (!wrap) {
-            wrap = document.createElement('div');
-            wrap.className = 'bb-client-tags-wrap';
-            nameEl.insertAdjacentElement('afterend', wrap);
-        }
-
-        const clientId = sessionStorage.getItem('client_id_' + activeId);
-        if (!clientId) return;
-
-        if (wrap.dataset.loadedClientId === clientId) return;
-        wrap.dataset.loadedClientId = clientId;
-
-        async function renderDomTags() {
-            const tags = await getClientTags(clientId);
-
-            wrap.innerHTML = tags.map(t => {
-                const dateStr = new Date(t.date || Date.now()).toLocaleDateString('ru-RU');
-                return `
-                    <div class="bb-dom-tag-badge color-${t.color || 'purple'}">
-                        <span>${t.title}</span>
-                        <span class="bb-dom-tag-rm" data-tag="${t.title}" title="Удалить метку">×</span>
-                        <div class="bb-tag-tooltip">
-                            <div class="bb-tt-title">${t.title}</div>
-                            ${t.desc ? `<div class="bb-tt-desc">${t.desc}</div>` : ''}
-                            <div class="bb-tt-meta">Автор: <b>${t.author}</b> · ${dateStr}</div>
-                        </div>
-                    </div>
-                `;
-            }).join('') + `<button type="button" class="bb-dom-tag-add">+ Метка</button>`;
-
-            wrap.querySelectorAll('.bb-dom-tag-rm').forEach(rm => {
-                rm.onclick = async (e) => {
-                    e.stopPropagation();
-                    if (confirm(`Удалить метку "${rm.dataset.tag}"?`)) {
-                        await removeClientTag(clientId, rm.dataset.tag);
-                        renderDomTags();
-                    }
-                };
-            });
-
-            wrap.querySelector('.bb-dom-tag-add').onclick = (e) => {
-                e.stopPropagation();
-                openTagCreatorModal(clientId, renderDomTags);
+        if (!session) {
+            session = {
+                sessionId: sId, clientId: String(clientId), clientName: clientName, pickupCode: currentCode,
+                foundAt: Date.now(), closedAt: null, durationSec: 0,
+                operator: apiOperator || getOperatorLogin(),
+                shelves: shelves, closeReason: 'active', postings: postingsList,
+                timeline: [{ time: Date.now(), type: 'start', text: 'Сессия открыта' }],
+                alienScans: [], tabId: TAB_ID, pvzId: CURRENT_PVZ
             };
+        } else {
+            if (clientId) session.clientId = String(clientId);
+            if (clientName) session.clientName = clientName;
+            if (shelves) session.shelves = shelves;
+            if (currentCode && !currentCode.includes('----')) session.pickupCode = currentCode;
+            if (apiOperator) session.operator = apiOperator;
+            if (!session.postings || session.postings.length === 0) session.postings = postingsList;
         }
-        renderDomTags();
-    }
-    setInterval(injectDomTags, 400);
 
+        activeSession = session;
+        await dbPut('sessions', session);
+        cloudSyncSession(session);
+    }
+
+    async function finalizeActiveSession(sId, reason = 'completed') {
+        const targetId = sId ? String(sId) : (activeSession ? activeSession.sessionId : getActiveSessionIdOnTab());
+        if (!targetId) return;
+
+        const session = await dbGet('sessions', String(targetId));
+        if (!session || session.closedAt) return;
+
+        session.closedAt = Date.now();
+        session.durationSec = Math.max(1, Math.round((session.closedAt - session.foundAt) / 1000));
+        session.closeReason = reason;
+
+        await dbPut('sessions', session);
+        cloudSyncSession(session);
+        if (activeSession && String(activeSession.sessionId) === String(targetId)) activeSession = null;
+    }
+
+    // ================= BLACKBOX INSPECTOR MODAL & UI =================
     const modalStyle = document.createElement('style');
     modalStyle.innerHTML = `
         #blackbox-modal-root, #bb-tag-creator-modal {
@@ -873,7 +603,6 @@
         .bb-input:focus { border-color: #38bdf8 !important; }
         textarea.bb-input { resize: vertical !important; max-width: 100% !important; min-height: 56px !important; }
 
-        /* Разделители и Lazy Аккордеоны дней */
         .bb-date-divider { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; margin-top: 10px; background: rgba(56, 189, 248, 0.07); border-radius: 8px; border-left: 3px solid #38bdf8; font-size: 12px; font-weight: 700; color: #38bdf8; cursor: pointer; user-select: none; }
         .bb-date-divider:hover { background: rgba(56, 189, 248, 0.12); }
         .bb-day-accordion { border: none; }
@@ -960,19 +689,10 @@
         .bb-tt-desc { font-size: 11px; color: #cbd5e1; line-height: 1.3; margin-bottom: 4px; word-break: break-word; }
         .bb-tt-meta { font-size: 9px; color: #64748b; font-family: monospace; border-top: 1px solid rgba(255,255,255,0.08); padding-top: 4px; }
 
-        /* 5.0 ПЛАШКА ПРИЕМКИ ТОВАРА */
         .bb-posting-placement-badge {
-            background: rgba(16, 185, 129, 0.12) !important;
-            border: 1px solid rgba(16, 185, 129, 0.3) !important;
-            color: #34d399 !important;
-            padding: 3px 7px !important;
-            border-radius: 6px !important;
-            font-size: 11px !important;
-            margin-top: 5px !important;
-            display: inline-flex !important;
-            align-items: center !important;
-            gap: 6px !important;
-            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif !important;
+            background: rgba(16, 185, 129, 0.12) !important; border: 1px solid rgba(16, 185, 129, 0.3) !important;
+            color: #34d399 !important; padding: 3px 7px !important; border-radius: 6px !important; font-size: 11px !important;
+            margin-top: 5px !important; display: inline-flex !important; align-items: center !important; gap: 6px !important;
         }
 
         .bb-stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
@@ -1008,13 +728,13 @@
             <div class="bb-window">
                 <div class="bb-header">
                     <div class="bb-title">
-                        ⬛ BLACKBOX <span>// АУДИТ 5.0</span>
+                        ⬛ BLACKBOX <span>// АУДИТ 5.1</span>
                         <span class="bb-pvz-badge">${CURRENT_PVZ}</span>
                     </div>
                     <div class="bb-tabs">
                         <button class="bb-tab-btn active" data-tab="sessions">Журнал смены</button>
                         <button class="bb-tab-btn" data-tab="lookup">Поиск «Потеряшки»</button>
-                        <button class="bb-tab-btn" data-tab="aliens">Аномалии</button>
+                        <button class="bb-tab-btn" data-tab="aliens">⚠️ Аномалии</button>
                         <button class="bb-tab-btn" data-tab="storage">База данных</button>
                     </div>
                     <span class="bb-close" id="bb-close-btn">✕</span>
@@ -1087,6 +807,7 @@
         const sidebar = document.getElementById('bb-replay-sidebar');
         if (!container) return;
 
+        // 1. ЖУРНАЛ СМЕНЫ
         if (tab === 'sessions') {
             sidebar.style.display = 'flex';
             let sessions = externalDumpData ? externalDumpData.sessions : await dbGetAll('sessions');
@@ -1244,6 +965,7 @@
             applyFilters();
         }
 
+        // 2. ПОИСК ПОТЕРЯШКИ
         if (tab === 'lookup') {
             sidebar.style.display = 'none';
             container.innerHTML = `
@@ -1288,6 +1010,7 @@
             };
         }
 
+        // 3. АНОМАЛИИ
         if (tab === 'aliens') {
             sidebar.style.display = 'none';
             const sessions = externalDumpData ? externalDumpData.sessions : await dbGetAll('sessions');
@@ -1320,6 +1043,7 @@
             `;
         }
 
+        // 4. БАЗА ДАННЫХ
         if (tab === 'storage') {
             sidebar.style.display = 'none';
             const sessions = await dbGetAll('sessions');
@@ -1427,7 +1151,6 @@
                 <div>Длительность: <b>${session.durationSec || 0} сек</b> (${session.closeReason || 'завершено'})</div>
             </div>
 
-            <!-- СЕКЦИЯ МЕТОК -->
             <div style="margin-top: 10px; border-top: 1px solid rgba(255,255,255,0.08); padding-top: 8px;">
                 <div style="font-size: 11px; font-weight: 700; color: #94a3b8; text-transform: uppercase; margin-bottom: 6px;">Метки клиента:</div>
                 <div class="bb-client-tags-wrap" id="bb-replay-tags-wrap" style="margin-left: 0;">
@@ -1454,13 +1177,12 @@
                                     ${p.status === 'issued' ? 'Выдан' : (p.status === 'annulated' ? 'Отказ (' + p.reasonText + ')' : 'На хранении')}
                                 </span>
                             </div>
-                            <!-- 5.0 ПЛАШКА ПРИЕМКИ ТОВАРА СО СКЛАДА -->
                             <div class="bb-inbound-slot">
                                 ${ib ? `
                                     <div class="bb-posting-placement-badge">
                                         📥 <b>${ib.text}</b> · ${ib.time} · <span style="opacity:0.7">${ib.operator}</span>
                                     </div>
-                                ` : `<div style="font-size: 10px; color: #475569; margin-top: 4px;">Загрузка истории приемки...</div>`}
+                                ` : `<div style="font-size: 10px; color: #475569; margin-top: 4px;">История приемки синхронизируется...</div>`}
                             </div>
                         </div>
                     `;
@@ -1477,25 +1199,6 @@
                 `).join('')}
             </div>
         `;
-
-        // Динамическая подгрузка приемок, если их не было в кэше
-        (session.postings || []).forEach(async (p) => {
-            if (!p.inbound) {
-                const ib = await fetchPostingInboundHistory(p.id);
-                if (ib) {
-                    p.inbound = ib;
-                    await dbPut('sessions', session);
-                    const card = sidebar.querySelector(`[data-posting-card-id="${p.id}"] .bb-inbound-slot`);
-                    if (card) {
-                        card.innerHTML = `
-                            <div class="bb-posting-placement-badge">
-                                📥 <b>${ib.text}</b> · ${ib.time} · <span style="opacity:0.7">${ib.operator}</span>
-                            </div>
-                        `;
-                    }
-                }
-            }
-        });
 
         sidebar.querySelectorAll('[data-rm-tag]').forEach(rm => {
             rm.onclick = async (e) => {
@@ -1527,7 +1230,10 @@
         }
     }
 
-    setInterval(cloudSyncTagsPull, 15000);
+    // Служебные циклы
+    setInterval(sendDeviceHeartbeat, 30000);
+    setInterval(cloudSyncTagsPull, 8000);
+    setInterval(checkRemoteAlerts, 10000);
 
     initDB();
 })();
