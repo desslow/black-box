@@ -93,6 +93,19 @@
         });
     }
 
+    function getDismissedAlerts() {
+        try {
+            return new Set(JSON.parse(localStorage.getItem('bb_dismissed_alerts') || '[]'));
+        } catch (e) { return new Set(); }
+    }
+
+    function saveDismissedAlert(id) {
+        const set = getDismissedAlerts();
+        set.add(String(id));
+        localStorage.setItem('bb_dismissed_alerts', JSON.stringify([...set]));
+    }
+
+
     async function cloudSyncSession(session) {
         if (!session || !session.sessionId) return;
         const payload = {
@@ -189,46 +202,49 @@
     }
 
     async function checkRemoteAlerts() {
+        const dismissed = getDismissedAlerts();
         const query = `alerts?is_active=eq.true&or=(target_scope.eq.ALL,and(target_scope.eq.PVZ,target_value.eq.${CURRENT_PVZ}),and(target_scope.eq.DEVICE,target_value.eq.${DEVICE_ID}))`;
         const alerts = await supabaseReq(query, 'GET');
+        
         if (Array.isArray(alerts) && alerts.length > 0) {
             for (let a of alerts) {
-                if (!dismissedAlerts.has(a.id)) {
+                if (!dismissed.has(String(a.id))) {
                     renderOzonNativeAlert(a);
-                    break;
+                    break; // Показываем по одному, чтобы не спамить экран
                 }
             }
         }
     }
 
+
     function renderOzonNativeAlert(alertObj) {
         if (document.getElementById(`bb-alert-${alertObj.id}`)) return;
 
-        let container = document.getElementById('ozi-notifications-container');
+        let container = document.getElementById('bb-notifications-root');
         if (!container) {
             container = document.createElement('div');
-            container.id = 'ozi-notifications-container';
-            container.style.cssText = 'position: fixed; top: 16px; right: 20px; z-index: 9999999; display: flex; flex-direction: column; gap: 8px; pointer-events: none;';
+            container.id = 'bb-notifications-root';
+            container.style.cssText = 'position: fixed !important; top: 20px !important; right: 24px !important; z-index: 9999999 !important; display: flex !important; flex-direction: column !important; gap: 8px !important; pointer-events: none !important;';
             document.body.appendChild(container);
         }
 
         const toast = document.createElement('div');
         toast.id = `bb-alert-${alertObj.id}`;
-        toast.style.pointerEvents = 'auto';
+        toast.style.cssText = 'pointer-events: auto !important; animation: slideUpPanel 0.25s ease-out !important;';
         toast.innerHTML = `
-            <div style="background: #1e293b; color: #fff; border: 1px solid #ef4444; border-radius: 12px; padding: 12px 16px; display: flex; align-items: flex-start; gap: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.6); max-width: 380px;">
+            <div style="background: #0f172a !important; color: #fff !important; border: 1.5px solid #ef4444 !important; border-radius: 12px !important; padding: 12px 16px !important; display: flex !important; align-items: flex-start !important; gap: 12px !important; box-shadow: 0 10px 35px rgba(0,0,0,0.7) !important; max-width: 380px !important; box-sizing: border-box !important;">
                 <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="#ef4444" style="flex-shrink:0; margin-top: 2px;"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
                 <div style="flex: 1;">
                     <div style="font-weight: 800; font-size: 13px; color: #f87171; margin-bottom: 2px;">${alertObj.title}</div>
-                    <div style="font-size: 12px; color: #e2e8f0; line-height: 1.3;">${alertObj.message}</div>
+                    <div style="font-size: 12px; color: #e2e8f0; line-height: 1.35;">${alertObj.message}</div>
                 </div>
-                <svg id="bb-close-alert-btn" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="cursor: pointer; flex-shrink: 0;"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                <span id="bb-close-alert-btn" style="cursor: pointer; color: #94a3b8; font-size: 18px; font-weight: bold; line-height: 1; padding: 0 4px; user-select: none;">✕</span>
             </div>
         `;
         container.appendChild(toast);
 
         toast.querySelector('#bb-close-alert-btn').onclick = () => {
-            dismissedAlerts.add(alertObj.id);
+            saveDismissedAlert(alertObj.id);
             toast.remove();
         };
     }
@@ -847,6 +863,7 @@
         async function renderDomTags() {
             const tags = await getClientTags(clientId);
 
+            // Рендерим ТОЛЬКО сами метки без кнопки добавления
             wrap.innerHTML = tags.map(t => {
                 const dateStr = new Date(t.date || Date.now()).toLocaleDateString('ru-RU');
                 return `
@@ -860,7 +877,7 @@
                         </div>
                     </div>
                 `;
-            }).join('') + `<button type="button" class="bb-dom-tag-add">+ Метка</button>`;
+            }).join('');
 
             wrap.querySelectorAll('.bb-dom-tag-rm').forEach(rm => {
                 rm.onclick = async (e) => {
@@ -871,11 +888,6 @@
                     }
                 };
             });
-
-            wrap.querySelector('.bb-dom-tag-add').onclick = (e) => {
-                e.stopPropagation();
-                openTagCreatorModal(clientId, renderDomTags);
-            };
         }
         renderDomTags();
     }
