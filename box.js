@@ -12,7 +12,7 @@
 (function() {
     'use strict';
 
-    const DB_NAME = '_o3_telemetry_cache';
+    const DB_NAME = '_o3_telemetry_cache_v2';
     const DB_VERSION = 1;
     const TTL_DAYS = 180;
     const ENABLE_DEV_PURGE = true;
@@ -587,6 +587,8 @@
         const currentOp = getOperatorLogin();
         const activeId = getActiveSessionIdOnTab();
 
+        let currentClientName = ''; 
+
         const isClientBarcode = /^\d{5,12}\*\d{3,6}$/.test(clean);
         if (isClientBarcode) {
             const parts = clean.split('*');
@@ -608,24 +610,29 @@
 
         if (activeId) {
             const session = await dbGet('sessions', String(activeId));
-            if (session && session.postings) {
-                isMatchInCurrent = session.postings.some(p => {
-                    const pId = String(p.id).toLowerCase();
-                    const pBar = (p.barcode || '').toLowerCase();
-                    const bList = (p.allBarcodes || []).map(b => String(b).toLowerCase());
-                    return pId.includes(clean) || clean.includes(pId) || pBar.includes(clean) || clean.includes(pBar) || bList.some(b => b.includes(clean));
-                });
+            if (session) {
+                // Вытаскиваем имя клиента из сессии
+                currentClientName = session.clientName || 'Без имени'; 
 
-                if (isMatchInCurrent) {
-                    recordTimelineEvent(activeId, 'scan', `Отсканирован товар: ${barcode}`, false, { barcode });
-                } else {
-                    verifyOzonArticle(barcode).then(res => {
-                        if (res.isOzonArticle) {
-                            recordTimelineEvent(activeId, 'alien_scan', `⚠️ ЧУЖОЙ ТОВАР СО СКЛАДА: ${barcode} (${res.name})`, true, { barcode, isRealParcel: true });
-                        } else {
-                            recordTimelineEvent(activeId, 'junk_scan', `ℹ️ Служебный/Внешний ШК: ${barcode}`, false, { barcode, isRealParcel: false });
-                        }
+                if (session.postings) {
+                    isMatchInCurrent = session.postings.some(p => {
+                        const pId = String(p.id).toLowerCase();
+                        const pBar = (p.barcode || '').toLowerCase();
+                        const bList = (p.allBarcodes || []).map(b => String(b).toLowerCase());
+                        return pId.includes(clean) || clean.includes(pId) || pBar.includes(clean) || clean.includes(pBar) || bList.some(b => b.includes(clean));
                     });
+
+                    if (isMatchInCurrent) {
+                        recordTimelineEvent(activeId, 'scan', `Отсканирован товар: ${barcode}`, false, { barcode });
+                    } else {
+                        verifyOzonArticle(barcode).then(res => {
+                            if (res.isOzonArticle) {
+                                recordTimelineEvent(activeId, 'alien_scan', `⚠️ ЧУЖОЙ ТОВАР СО СКЛАДА: ${barcode} (${res.name})`, true, { barcode, isRealParcel: true });
+                            } else {
+                                recordTimelineEvent(activeId, 'junk_scan', `ℹ️ Служебный/Внешний ШК: ${barcode}`, false, { barcode, isRealParcel: false });
+                            }
+                        });
+                    }
                 }
             }
         }
