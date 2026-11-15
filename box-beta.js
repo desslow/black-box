@@ -1,10 +1,10 @@
 // ==UserScript==
-// @name         Ozon BlackBox (Forensics & Audit Core)
+// @name         Ozon BlackBox
 // @namespace    http://tampermonkey.net/
-// @version      5.1.1
-// @description  Ozon BlackBox 5.1.1 - Fixed Keydown Hotkeys & Full Core
+// @version      5.2
+// @description  Audit
 // @author       desslow
-// @match        https://*.ozon.ru/*
+// @match        https://turbo-pvz.ozon.ru/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
 // @connect      prsstkodpfugnyazrxrp.supabase.co
@@ -13,6 +13,11 @@
 (function() {
     'use strict';
 
+    // СТРОГИЙ ГАРД: Работаем ТОЛЬКО в приложении ТурбоПВЗ, игнорируем любые мусорные фреймы
+    if (!window.location.hostname.includes('turbo-pvz.ozon.ru')) {
+        return;
+    }
+
     const SUPABASE_URL = '';
     const SUPABASE_KEY = '';
     const PVZ_LIST = ['PVZ_2210', 'PVZ_2379', 'PVZ_3021', 'PVZ_3228', 'PVZ_3239'];
@@ -20,7 +25,7 @@
     function getPvzId() {
         let saved = localStorage.getItem('bb_current_pvz');
         if (!saved || !PVZ_LIST.includes(saved)) {
-            saved = prompt(`[BlackBox] Выберите ПВЗ для этого ПК:\n${PVZ_LIST.join(', ')}`, PVZ_LIST[0]);
+            saved = prompt(`[BlackBox 5.2] Выберите ПВЗ для этого компьютера:\n${PVZ_LIST.join(', ')}`, PVZ_LIST[0]);
             if (!PVZ_LIST.includes(saved)) saved = PVZ_LIST[0];
             localStorage.setItem('bb_current_pvz', saved);
         }
@@ -28,15 +33,17 @@
     }
     const CURRENT_PVZ = getPvzId();
 
-    function getDeviceId() {
-        let dId = localStorage.getItem('bb_device_id');
+    // ГЕНЕРАЦИЯ ПОНЯТНОГО И СТАБИЛЬНОГО DEVICE ID (НАПР: PVZ_2210-PC-4A8F)
+    function getDeterministicDeviceId() {
+        let dId = localStorage.getItem('bb_device_id_v2');
         if (!dId) {
-            dId = 'DEV_' + Math.random().toString(36).slice(2, 9).toUpperCase();
-            localStorage.setItem('bb_device_id', dId);
+            const shortHash = Math.random().toString(36).slice(2, 6).toUpperCase();
+            dId = `${CURRENT_PVZ}-PC-${shortHash}`;
+            localStorage.setItem('bb_device_id_v2', dId);
         }
         return dId;
     }
-    const DEVICE_ID = getDeviceId();
+    const DEVICE_ID = getDeterministicDeviceId();
 
     const DB_NAME = '_o3_telemetry_cache_v5';
     const DB_VERSION = 1;
@@ -57,7 +64,6 @@
     const postingsInboundCache = new Map();
     const pendingGiveoutTasks = new Map();
     const sessionGiveoutPayloads = new Map();
-    const dismissedAlerts = new Set();
 
     const TAB_ID = Math.random().toString(36).slice(2, 9);
     const RUS_TO_ENG = {
@@ -93,18 +99,64 @@
         });
     }
 
+    // ================= НАДЕЖНЫЙ КОНТРОЛЬ АЛЕРТОВ (TTL + МОДАЛКА) =================
     function getDismissedAlerts() {
         try {
-            return new Set(JSON.parse(localStorage.getItem('bb_dismissed_alerts') || '[]'));
+            return new Set(JSON.parse(localStorage.getItem('bb_dismissed_alerts_v2') || '[]'));
         } catch (e) { return new Set(); }
     }
 
     function saveDismissedAlert(id) {
         const set = getDismissedAlerts();
         set.add(String(id));
-        localStorage.setItem('bb_dismissed_alerts', JSON.stringify([...set]));
+        localStorage.setItem('bb_dismissed_alerts_v2', JSON.stringify([...set]));
     }
 
+    async function checkRemoteAlerts() {
+        // Запрашиваем только активные алерты, у которых не истек срок жизни (TTL)
+        const nowIso = new Date().toISOString();
+        const query = `alerts?is_active=eq.true&expires_at=gt.${nowIso}&or=(target_scope.eq.ALL,and(target_scope.eq.PVZ,target_value.eq.${CURRENT_PVZ}),and(target_scope.eq.DEVICE,target_value.eq.${DEVICE_ID}))`;
+        const alerts = await supabaseReq(query, 'GET');
+
+        if (Array.isArray(alerts) && alerts.length > 0) {
+            const dismissed = getDismissedAlerts();
+            // Находим первый алерт, который оператор на этом ПК еще не подтверждал
+            const freshAlert = alerts.find(a => !dismissed.has(String(a.id)));
+            if (freshAlert) {
+                renderCentralAlertModal(freshAlert);
+            }
+        }
+    }
+
+    function renderCentralAlertModal(alertObj) {
+        if (document.getElementById(`bb-alert-modal-root`)) return;
+
+        const modal = document.createElement('div');
+        modal.id = `bb-alert-modal-root`;
+        modal.innerHTML = `
+            <div class="bb-alert-window">
+                <div class="bb-alert-head">
+                    <div style="display:flex; align-items:center; gap:8px;">
+                        <span class="bb-alert-dot"></span>
+                        <span class="bb-alert-title">${alertObj.title || 'Служебное уведомление'}</span>
+                    </div>
+                    <span class="bb-alert-scope-pill">${alertObj.target_scope === 'ALL' ? 'Вся сеть' : CURRENT_PVZ}</span>
+                </div>
+                <div class="bb-alert-body">
+                    ${alertObj.message}
+                </div>
+                <div class="bb-alert-foot">
+                    <button class="bb-alert-btn" id="bb-dismiss-alert-btn">Ознакомлен</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+
+        modal.querySelector('#bb-dismiss-alert-btn').onclick = () => {
+            saveDismissedAlert(alertObj.id);
+            modal.remove();
+        };
+    }
 
     async function cloudSyncSession(session) {
         if (!session || !session.sessionId) return;
@@ -165,6 +217,7 @@
         supabaseReq('client_tags?on_conflict=client_id', 'POST', payload);
     }
 
+    // ТЕЛЕМЕТРИЯ: Передаем честные данные строго из активного окна ТурбоПВЗ
     async function sendDeviceHeartbeat() {
         let usageMb = 0, quotaMb = 0, percent = 0;
         if (navigator.storage && navigator.storage.estimate) {
@@ -179,7 +232,7 @@
         const payload = {
             device_id: DEVICE_ID,
             pvz_id: CURRENT_PVZ,
-            current_operator: getOperatorLogin() || 'Не авторизован',
+            current_operator: getOperatorLogin() || 'Ожидание смены',
             disk_usage_mb: usageMb,
             disk_quota_mb: quotaMb,
             disk_percent: percent,
@@ -199,54 +252,6 @@
             time: Date.now()
         };
         supabaseReq('inbounds', 'POST', payload);
-    }
-
-    async function checkRemoteAlerts() {
-        const dismissed = getDismissedAlerts();
-        const query = `alerts?is_active=eq.true&or=(target_scope.eq.ALL,and(target_scope.eq.PVZ,target_value.eq.${CURRENT_PVZ}),and(target_scope.eq.DEVICE,target_value.eq.${DEVICE_ID}))`;
-        const alerts = await supabaseReq(query, 'GET');
-        
-        if (Array.isArray(alerts) && alerts.length > 0) {
-            for (let a of alerts) {
-                if (!dismissed.has(String(a.id))) {
-                    renderOzonNativeAlert(a);
-                    break; // Показываем по одному, чтобы не спамить экран
-                }
-            }
-        }
-    }
-
-
-    function renderOzonNativeAlert(alertObj) {
-        if (document.getElementById(`bb-alert-${alertObj.id}`)) return;
-
-        let container = document.getElementById('bb-notifications-root');
-        if (!container) {
-            container = document.createElement('div');
-            container.id = 'bb-notifications-root';
-            container.style.cssText = 'position: fixed !important; top: 20px !important; right: 24px !important; z-index: 9999999 !important; display: flex !important; flex-direction: column !important; gap: 8px !important; pointer-events: none !important;';
-            document.body.appendChild(container);
-        }
-
-        const toast = document.createElement('div');
-        toast.id = `bb-alert-${alertObj.id}`;
-        toast.style.cssText = 'pointer-events: auto !important; animation: slideUpPanel 0.25s ease-out !important;';
-        toast.innerHTML = `
-            <div style="background: #0f172a !important; color: #fff !important; border: 1.5px solid #ef4444 !important; border-radius: 12px !important; padding: 12px 16px !important; display: flex !important; align-items: flex-start !important; gap: 12px !important; box-shadow: 0 10px 35px rgba(0,0,0,0.7) !important; max-width: 380px !important; box-sizing: border-box !important;">
-                <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="#ef4444" style="flex-shrink:0; margin-top: 2px;"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
-                <div style="flex: 1;">
-                    <div style="font-weight: 800; font-size: 13px; color: #f87171; margin-bottom: 2px;">${alertObj.title}</div>
-                    <div style="font-size: 12px; color: #e2e8f0; line-height: 1.35;">${alertObj.message}</div>
-                </div>
-                <span id="bb-close-alert-btn" style="cursor: pointer; color: #94a3b8; font-size: 18px; font-weight: bold; line-height: 1; padding: 0 4px; user-select: none;">✕</span>
-            </div>
-        `;
-        container.appendChild(toast);
-
-        toast.querySelector('#bb-close-alert-btn').onclick = () => {
-            saveDismissedAlert(alertObj.id);
-            toast.remove();
-        };
     }
 
     // ================= INDEXEDDB =================
@@ -392,7 +397,6 @@
         if (!bar && p.items?.[0]?.exemplars?.[0]?.barcodes?.[0]) bar = p.items[0].exemplars[0].barcodes[0];
         if (!bar) bar = String(p.id);
 
-        // Индивидуальная ячейка конкретного отправления
         let specificShelf = p.shelfAddress || p.address || '';
         if (!specificShelf && Array.isArray(p.postingShelves) && p.postingShelves.length > 0) {
             specificShelf = p.postingShelves.join(', ');
@@ -403,14 +407,14 @@
             id: String(p.id),
             name: title,
             barcode: bar,
-            shelf: specificShelf, // ТОЧНАЯ ЯЧЕЙКА ЭТОГО ТОВАРА
+            shelf: specificShelf,
             allBarcodes: (p.barcodes || []).map(b => String(b).toLowerCase()),
             price: p.price || 0,
             status: 'storage',
-            isScanned: false,         // Был ли реальный скан?
-            scannedAt: null,          // Точный timestamp
-            scannedTimeFormatted: '', // Время вида 14:28:05
-            scannedBy: '',            // Кто именно пикнул
+            isScanned: false,
+            scannedAt: null,
+            scannedTimeFormatted: '',
+            scannedBy: '',
             reasonText: '',
             inbound: null
         };
@@ -451,7 +455,6 @@
             finalizeActiveSession(closedId, 'completed');
         }
 
-        // 2. Обработка выдачи giveout-v3
         if (url.includes('/api2/giveout/Postings/giveout-v3')) {
             try {
                 const parsedReq = typeof reqBody === 'string' ? JSON.parse(reqBody) : reqBody;
@@ -466,7 +469,6 @@
                     });
                     sessionGiveoutPayloads.set(sId, postingsMap);
 
-                    // Фикс: ловим taskId в любых вариациях Озона (id / taskId)
                     const taskList = parsedRes?.tasks || parsedRes?.data?.tasks;
                     if (Array.isArray(taskList) && taskList.length > 0) {
                         taskList.forEach(t => {
@@ -474,17 +476,14 @@
                             pendingGiveoutTasks.set(taskIdStr, { sessionId: sId });
                         });
                     } else {
-                        // Если тасок нет или статус сразу выполнен — закрываем немедленно
                         finalizeActiveSession(sId, 'completed');
                     }
                 }
             } catch (e) {
-                // Если парсинг упал — страхуем по текущей активной сессии
                 finalizeActiveSession(null, 'completed');
             }
         }
 
-        // 3. Статусы тасок giveout-v2-tasks-statuses
         if (url.includes('/api2/giveout/Postings/giveout-v2-tasks-statuses') || url.includes('/tasks-statuses')) {
             try {
                 const parsedRes = typeof resData === 'string' ? JSON.parse(resData) : resData;
@@ -506,24 +505,6 @@
                             if (!hasActive) {
                                 finalizeActiveSession(taskInfo.sessionId, 'completed');
                             }
-                        }
-                    });
-                }
-            } catch (e) {}
-        }
-
-        if (url.includes('/api2/giveout/Postings/giveout-v2-tasks-statuses')) {
-            try {
-                const parsedRes = typeof resData === 'string' ? JSON.parse(resData) : resData;
-                if (parsedRes && Array.isArray(parsedRes.statuses)) {
-                    parsedRes.statuses.forEach(st => {
-                        const tId = String(st.id);
-                        if (st.status === 'Processed' && pendingGiveoutTasks.has(tId)) {
-                            const taskInfo = pendingGiveoutTasks.get(tId);
-                            pendingGiveoutTasks.delete(tId);
-                            let hasActiveTasks = false;
-                            for (let entry of pendingGiveoutTasks.values()) { if (entry.sessionId === taskInfo.sessionId) { hasActiveTasks = true; break; } }
-                            if (!hasActiveTasks) finalizeActiveSession(taskInfo.sessionId, 'completed');
                         }
                     });
                 }
@@ -592,22 +573,15 @@
 
         let session = await dbGet('sessions', sId);
 
-        // 1. Ищем настоящий код в sessionStorage, памяти сессии или кэше
-        let realCode = sessionStorage.getItem('client_code_' + sId) || 
-                       sessionStorage.getItem('client_code_pending');
-
-        // Если в сохраненной сессии уже был валидный код без дефисов — НИКОГДА его не затираем
+        let realCode = sessionStorage.getItem('client_code_' + sId) || sessionStorage.getItem('client_code_pending');
         if (!realCode && session && session.pickupCode && !session.pickupCode.includes('----')) {
             realCode = session.pickupCode;
         }
-
-        // Если кода все еще нет, проверяем по общему clientId
         if (!realCode && clientId) {
             const cachedByCid = sessionStorage.getItem('client_code_cid_' + clientId);
             if (cachedByCid) realCode = cachedByCid;
         }
 
-        // И только если кода ВООБЩЕ нигде нет в природе — ставим заглушку
         const currentCode = realCode || (clientId ? `${clientId}*----` : '');
 
         if (realCode && !realCode.includes('----')) {
@@ -617,7 +591,6 @@
         }
 
         const apiOperator = sessionStorage.getItem('session_operator_' + sId) || '';
-
         const postingsList = readyPostings.map(extractPostingDetails);
 
         if (!session) {
@@ -665,7 +638,6 @@
         session.postings.forEach(pObj => {
             const pIdStr = String(pObj.id);
 
-            // 1. ПРОВЕРКА ПО ПЕРЕХВАЧЕННОМУ СЕТЕВОМУ GIVE-OUT ПАКЕТУ
             if (apiGiveoutData) {
                 if (apiGiveoutData.has(pIdStr)) {
                     const itemMeta = apiGiveoutData.get(pIdStr);
@@ -678,13 +650,10 @@
                         issuedCount++;
                     }
                 } else {
-                    // Товара не было в запросе выдачи — он остался на складе!
                     pObj.status = 'storage';
                     storageCount++;
                 }
-            } 
-            // 2. ФОЛЛБЭК: АНАЛИЗ DOM КАРТОЧКИ ТОВАРА НА ЭКРАНЕ
-            else {
+            } else {
                 const cardWrapper = document.querySelector(`[data-testid="${pObj.id}"]`) || 
                                     Array.from(document.querySelectorAll('[class*="_card_"]')).find(c => c.textContent.includes(pObj.name) || (pObj.barcode && c.textContent.includes(pObj.barcode)));
 
@@ -703,7 +672,6 @@
                         storageCount++;
                     }
                 } else {
-                    // Если карточки нет в DOM и запроса не было — товар точно на хранении
                     pObj.status = 'storage';
                     storageCount++;
                 }
@@ -732,9 +700,9 @@
         const listEl = document.getElementById('bb-sessions-list');
         if (listEl) renderTabContent('sessions');
     }
+
     // ================= ГЛОБАЛЬНЫЙ СЛУШАТЕЛЬ КЛАВИАТУРЫ И СКАНИРОВАНИЯ =================
     window.addEventListener('keydown', function(e) {
-        // Хоткей открытия инспектора BlackBox
         if (e.ctrlKey && e.shiftKey && e.altKey && e.code === 'KeyB') {
             e.preventDefault();
             e.stopPropagation();
@@ -742,8 +710,9 @@
             return;
         }
 
-        // Закрытие окон по Escape
         if (e.key === 'Escape') {
+            const modalRoot = document.getElementById('bb-alert-modal-root');
+            if (modalRoot) { e.preventDefault(); e.stopPropagation(); modalRoot.remove(); return; }
             const tModal = document.getElementById('bb-tag-creator-modal');
             if (tModal) { e.preventDefault(); e.stopPropagation(); tModal.remove(); return; }
             const modal = document.getElementById('blackbox-modal-root');
@@ -789,7 +758,6 @@
             return;
         }
 
-
         let isMatchInCurrent = false;
         if (activeId) {
             const session = await dbGet('sessions', String(activeId));
@@ -808,7 +776,6 @@
                         const nowTs = Date.now();
                         const timeStr = new Date(nowTs).toLocaleTimeString('ru-RU');
 
-                        // Фиксируем физический скан намертво в объекте товара
                         targetPosting.isScanned = true;
                         targetPosting.scannedAt = nowTs;
                         targetPosting.scannedTimeFormatted = timeStr;
@@ -822,7 +789,6 @@
                             exactTime: nowTs
                         });
 
-                        // Сохраняем сессию с обновленными данными товара
                         await dbPut('sessions', session);
                         cloudSyncSession(session);
                     } else {
@@ -842,60 +808,31 @@
         cloudSyncScan(scanRecord);
     }
 
-    // ================= МОДАЛКА СОЗДАНИЯ МЕТКИ =================
-    function openTagCreatorModal(clientId, onCreated) {
-        let ex = document.getElementById('bb-tag-creator-modal');
-        if (ex) ex.remove();
+    async function recordTimelineEvent(sId, type, text, isAlien = false, extraData = {}) {
+        const targetId = sId ? String(sId) : (activeSession ? activeSession.sessionId : null);
+        if (!targetId) return;
+        const session = await dbGet('sessions', targetId);
+        if (!session) return;
 
-        const activeId = getActiveSessionIdOnTab();
-        const currentOp = (activeId && sessionStorage.getItem('session_operator_' + activeId)) || getOperatorLogin() || 'Оператор';
+        const ev = { time: Date.now(), type, text, isAlien, ...extraData };
+        session.timeline.push(ev);
+        if (isAlien) session.alienScans.push(ev);
+        activeSession = session;
+        await dbPut('sessions', session);
+        cloudSyncSession(session);
+    }
 
-        const modal = document.createElement('div');
-        modal.id = 'bb-tag-creator-modal';
-        modal.innerHTML = `
-            <div class="bb-tag-dialog">
-                <div class="bb-tag-dialog-head">
-                    <span>Метка для клиента: <b>#${clientId}</b></span>
-                    <span class="bb-tag-dialog-close" id="bb-tag-cancel">✕</span>
-                </div>
-                <div class="bb-tag-dialog-body">
-                    <label class="bb-tag-label">Название метки</label>
-                    <input type="text" class="bb-input" id="bb-tag-title-inp" placeholder="..." autofocus>
-
-                    <label class="bb-tag-label">Описание</label>
-                    <textarea class="bb-input" id="bb-tag-desc-inp" rows="2" placeholder="Заметка операторам при выдаче..."></textarea>
-
-                    <label class="bb-tag-label">Цвет</label>
-                    <div class="bb-tag-colors">
-                        <label class="bb-color-opt"><input type="radio" name="tagColor" value="purple" checked><span class="bb-color-dot" style="background: #a855f7;"></span><span>Фиолетовый</span></label>
-                        <label class="bb-color-opt"><input type="radio" name="tagColor" value="amber"><span class="bb-color-dot" style="background: #f59e0b;"></span><span>Оранжевый</span></label>
-                        <label class="bb-color-opt"><input type="radio" name="tagColor" value="red"><span class="bb-color-dot" style="background: #ef4444;"></span><span>Красный</span></label>
-                        <label class="bb-color-opt"><input type="radio" name="tagColor" value="emerald"><span class="bb-color-dot" style="background: #10b981;"></span><span>Зеленый</span></label>
-                    </div>
-                </div>
-                <div class="bb-tag-dialog-foot">
-                    <button class="bb-btn-save-tag" id="bb-tag-save-btn">Сохранить</button>
-                </div>
-            </div>
-        `;
-        document.body.appendChild(modal);
-
-        modal.querySelector('#bb-tag-cancel').onclick = () => modal.remove();
-        modal.querySelector('#bb-tag-save-btn').onclick = async () => {
-            const title = modal.querySelector('#bb-tag-title-inp').value.trim();
-            const desc = modal.querySelector('#bb-tag-desc-inp').value.trim();
-            const color = modal.querySelector('input[name="tagColor"]:checked').value;
-
-            if (!title) {
-                modal.querySelector('#bb-tag-title-inp').focus();
-                return;
+    async function verifyOzonArticle(barcode) {
+        try {
+            const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json, text/plain, */*' };
+            if (window._ozonAuthHeaders) Object.assign(headers, window._ozonAuthHeaders);
+            const res = await fetch('https://turbo-pvz.ozon.ru/p-api/article-tracking/Entity/Find', { method: 'POST', headers: headers, body: JSON.stringify({ isManualInput: false, name: barcode }), credentials: 'same-origin' });
+            if (res.ok) {
+                const data = await res.json();
+                if (data.entity && data.entity.id) return { isOzonArticle: true, name: data.entity.name || '' };
             }
-
-            const tagObj = { title, desc, color, author: currentOp, date: Date.now() };
-            await addClientTag(clientId, tagObj);
-            modal.remove();
-            if (onCreated) onCreated();
-        };
+        } catch (e) {}
+        return { isOzonArticle: false };
     }
 
     function injectDomTags() {
@@ -922,7 +859,6 @@
         async function renderDomTags() {
             const tags = await getClientTags(clientId);
 
-            // Рендерим ТОЛЬКО сами метки без кнопки добавления
             wrap.innerHTML = tags.map(t => {
                 const dateStr = new Date(t.date || Date.now()).toLocaleDateString('ru-RU');
                 return `
@@ -952,15 +888,42 @@
     }
     setInterval(injectDomTags, 400);
 
-    // ================= BLACKBOX INSPECTOR CSS =================
+    // ================= СТИЛИ ЧЕРНОГО ЯЩИКА И МОДАЛКИ АЛЕРТОВ =================
     const modalStyle = document.createElement('style');
     modalStyle.innerHTML = `
-        #blackbox-modal-root, #bb-tag-creator-modal {
+        #blackbox-modal-root {
             position: fixed !important; top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important;
             background: rgba(2, 6, 23, 0.8) !important; backdrop-filter: blur(20px) saturate(180%) !important;
             z-index: 10000000 !important; display: flex !important; align-items: center !important; justify-content: center !important;
             font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif !important; color: #f8fafc !important;
         }
+
+        /* ЦЕНТРАЛЬНАЯ СТРОГАЯ МОДАЛКА АЛЕРТА (НЕ СБИВАЕТ ОПЕРАТОРА) */
+        #bb-alert-modal-root {
+            position: fixed !important; top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important;
+            background: rgba(2, 6, 23, 0.85) !important; backdrop-filter: blur(12px) !important;
+            z-index: 10000005 !important; display: flex !important; align-items: center !important; justify-content: center !important;
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif !important;
+        }
+        .bb-alert-window {
+            background: #0f172a !important; border: 1.5px solid #ef4444 !important; border-radius: 14px !important;
+            width: 440px !important; max-width: 90vw !important; box-shadow: 0 25px 60px rgba(0,0,0,0.85) !important;
+            display: flex !important; flex-direction: column !important; overflow: hidden !important;
+        }
+        .bb-alert-head {
+            display: flex !important; justify-content: space-between !important; align-items: center !important;
+            padding: 12px 18px !important; border-bottom: 1px solid rgba(255,255,255,0.08) !important; background: rgba(239, 68, 68, 0.08) !important;
+        }
+        .bb-alert-dot { width: 8px; height: 8px; border-radius: 50%; background: #ef4444; box-shadow: 0 0 8px #ef4444; display: inline-block; }
+        .bb-alert-title { font-weight: 800; font-size: 13px; color: #f87171; letter-spacing: 0.3px; }
+        .bb-alert-scope-pill { font-size: 10px; font-weight: 800; font-family: monospace; background: rgba(255,255,255,0.08); padding: 2px 6px; border-radius: 4px; color: #cbd5e1; }
+        .bb-alert-body { padding: 18px !important; font-size: 13px !important; line-height: 1.45 !important; color: #f8fafc !important; }
+        .bb-alert-foot { padding: 12px 18px !important; border-top: 1px solid rgba(255,255,255,0.08) !important; display: flex !important; justify-content: flex-end !important; }
+        .bb-alert-btn {
+            background: #005bff !important; color: #ffffff !important; border: none !important; padding: 8px 20px !important;
+            border-radius: 8px !important; font-weight: 700 !important; font-size: 12px !important; cursor: pointer !important;
+        }
+        .bb-alert-btn:hover { background: #004ecc !important; }
 
         .bb-window { width: 1080px !important; max-width: 96vw !important; height: 780px !important; max-height: 92vh !important; background: #0f172a !important; border: 1px solid rgba(255, 255, 255, 0.12) !important; border-radius: 16px !important; box-shadow: 0 24px 60px rgba(0, 0, 0, 0.75) !important; display: flex !important; flex-direction: column !important; overflow: hidden !important; }
         .bb-header { display: flex !important; align-items: center !important; justify-content: space-between !important; padding: 14px 20px !important; border-bottom: 1px solid rgba(255, 255, 255, 0.08) !important; background: rgba(255, 255, 255, 0.02) !important; }
@@ -985,58 +948,16 @@
 
         .bb-input { background: rgba(255, 255, 255, 0.05) !important; border: 1px solid rgba(255, 255, 255, 0.12) !important; color: #fff !important; padding: 8px 12px !important; border-radius: 8px !important; font-size: 13px !important; outline: none !important; box-sizing: border-box !important; }
         .bb-input:focus { border-color: #38bdf8 !important; }
-        textarea.bb-input { resize: vertical !important; max-width: 100% !important; min-height: 56px !important; }
-
-        .bb-date-divider { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; margin-top: 10px; background: rgba(56, 189, 248, 0.07); border-radius: 8px; border-left: 3px solid #38bdf8; font-size: 12px; font-weight: 700; color: #38bdf8; cursor: pointer; user-select: none; }
-        .bb-date-divider:hover { background: rgba(56, 189, 248, 0.12); }
-        .bb-day-accordion { border: none; }
-        .bb-day-accordion summary { list-style: none; }
-        .bb-day-accordion summary::-webkit-details-marker { display: none; }
-
-        .bb-tree-root { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
-        .bb-thread-children { margin-left: 16px; padding-left: 10px; border-left: 2px solid rgba(255, 255, 255, 0.12); display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
 
         .bb-card { background: rgba(255, 255, 255, 0.03) !important; border: 1px solid rgba(255, 255, 255, 0.06) !important; border-radius: 10px !important; padding: 10px 12px !important; cursor: pointer !important; transition: all 0.15s !important; display: flex !important; flex-direction: column !important; gap: 5px !important; }
         .bb-card:hover { background: rgba(255, 255, 255, 0.06) !important; border-color: rgba(255, 255, 255, 0.15) !important; }
         .bb-card.has-alien { border-left: 3px solid #ef4444 !important; }
 
-        .bb-card-head { display: flex !important; justify-content: space-between !important; align-items: center !important; }
-        .bb-card-name { font-weight: 700; font-size: 13px; color: #f8fafc; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-        .bb-card-time { font-size: 11px; color: #64748b; font-family: monospace; }
-        .bb-card-sub { font-size: 12px; color: #94a3b8; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-
-        .bb-tag { font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: 4px; white-space: nowrap; }
-        .bb-tag-warn { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
-        .bb-tag-repeat { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3); }
-
-        .bb-btn { background: #1c3557; color: #38bdf8; border: 1px solid #2b4260; padding: 6px 12px; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.15s; display: inline-flex; align-items: center; gap: 5px;}
-        .bb-btn:hover { background: #007aff; color: #fff; }
-        .bb-btn-danger { background: rgba(239, 68, 68, 0.15); color: #f87171; border-color: rgba(239, 68, 68, 0.3); }
-        .bb-btn-danger:hover { background: #ef4444; color: #fff; }
-
-        /* Диалог создания метки */
-        .bb-tag-dialog { width: 400px; background: #0f172a; border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 14px; box-shadow: 0 20px 50px rgba(0,0,0,0.85); display: flex; flex-direction: column; overflow: hidden; }
-        .bb-tag-dialog-head { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; border-bottom: 1px solid rgba(255, 255, 255, 0.08); font-size: 13px; font-weight: 700; }
-        .bb-tag-dialog-close { cursor: pointer; color: #64748b; font-size: 16px; }
-        .bb-tag-dialog-close:hover { color: #fff; }
-        .bb-tag-dialog-body { padding: 16px; display: flex; flex-direction: column; gap: 8px; }
-        .bb-tag-label { font-size: 11px; font-weight: 700; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 4px; }
-        .bb-tag-colors { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-top: 2px; }
-        .bb-color-opt { display: flex; align-items: center; gap: 7px; font-size: 12px; cursor: pointer; user-select: none; }
-        .bb-color-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
-        .bb-tag-dialog-foot { padding: 12px 16px; border-top: 1px solid rgba(255, 255, 255, 0.08); display: flex; justify-content: flex-end; }
-        .bb-btn-save-tag { background: #005bff; color: #ffffff; border: none; padding: 7px 18px; border-radius: 8px; font-weight: 700; font-size: 12px; cursor: pointer; transition: background 0.15s; }
-        .bb-btn-save-tag:hover { background: #004ecc; }
-
-        /* ВЫСОКОКОНТРАСТНЫЕ ПЛОТНЫЕ МЕТКИ */
-        .bb-client-tags-wrap { display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-left: 6px; }
         .bb-dom-tag-badge {
             position: relative; padding: 3px 8px !important; border-radius: 6px !important; font-size: 12px !important;
             font-weight: 700 !important; display: inline-flex !important; align-items: center !important; justify-content: center !important;
             gap: 6px !important; cursor: default !important; user-select: none !important; line-height: 1 !important; box-sizing: border-box !important;
         }
-        .bb-dom-tag-badge span:first-child { display: inline-block; vertical-align: middle; transform: translateY(-0.5px); }
-
         .bb-dom-tag-badge.color-purple { background: #f3e8ff !important; color: #7e22ce !important; border: 1px solid #d8b4fe !important; }
         .bb-dom-tag-badge.color-amber  { background: #fef3c7 !important; color: #b45309 !important; border: 1px solid #fde68a !important; }
         .bb-dom-tag-badge.color-red    { background: #fee2e2 !important; color: #b91c1c !important; border: 1px solid #fecaca !important; }
@@ -1045,46 +966,16 @@
         .bb-dom-tag-rm { cursor: pointer !important; opacity: 0.5 !important; padding: 0 1px !important; font-weight: 800 !important; font-size: 12px !important; line-height: 1 !important; display: inline-flex !important; align-items: center !important; }
         .bb-dom-tag-rm:hover { opacity: 1 !important; }
 
-        .bb-dom-tag-add {
-            background: #f1f5f9 !important; color: #475569 !important; border: 1px solid #cbd5e1 !important;
-            padding: 3px 8px !important; border-radius: 6px !important; font-size: 11px !important; font-weight: 600 !important;
-            cursor: pointer !important; transition: all 0.15s !important; line-height: 1 !important; display: inline-flex !important;
-            align-items: center !important; justify-content: center !important;
-        }
-        .bb-dom-tag-add:hover { background: #e2e8f0 !important; color: #0284c7 !important; border-color: #94a3b8 !important; }
-
-        .bb-panel-tag-add {
-            background: #1c3557 !important; color: #38bdf8 !important; border: 1px solid #0284c7 !important;
-            padding: 4px 10px !important; border-radius: 6px !important; font-size: 11px !important; font-weight: 700 !important;
-            cursor: pointer !important; transition: all 0.15s !important; line-height: 1 !important; display: inline-flex !important;
-            align-items: center !important; gap: 4px !important;
-        }
-        .bb-panel-tag-add:hover { background: #007aff !important; color: #ffffff !important; }
-
         .bb-tag-tooltip {
             position: absolute; top: calc(100% + 8px); left: 50%; transform: translateX(-50%); width: 220px;
             max-height: 180px; overflow-y: auto; background: #090d16; border: 1px solid rgba(255, 255, 255, 0.2);
             border-radius: 8px; padding: 8px 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.85); pointer-events: none; opacity: 0;
             transition: opacity 0.15s ease; z-index: 8999 !important; text-align: left;
         }
-        .bb-tag-tooltip::after { content: ''; position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%); border-width: 5px; border-style: solid; border-color: transparent transparent #090d16 transparent; }
         .bb-dom-tag-badge:hover .bb-tag-tooltip { opacity: 1; }
         .bb-tt-title { font-size: 12px; font-weight: 800; color: #f8fafc; margin-bottom: 2px; }
         .bb-tt-desc { font-size: 11px; color: #cbd5e1; line-height: 1.3; margin-bottom: 4px; word-break: break-word; }
         .bb-tt-meta { font-size: 9px; color: #64748b; font-family: monospace; border-top: 1px solid rgba(255,255,255,0.08); padding-top: 4px; }
-
-        .bb-stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
-        .bb-stat-card { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 14px; display: flex; flex-direction: column; gap: 4px; }
-        .bb-stat-title { font-size: 11px; color: #94a3b8; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;}
-        .bb-stat-value { font-size: 22px; font-weight: 800; color: #f8fafc; }
-        .bb-progress-bar { width: 100%; height: 6px; background: rgba(255,255,255,0.1); border-radius: 3px; overflow: hidden; margin-top: 6px;}
-        .bb-progress-fill { height: 100%; background: linear-gradient(90deg, #38bdf8, #818cf8); }
-
-        .bb-timeline-node { position: relative; padding-left: 18px; border-left: 2px solid rgba(255, 255, 255, 0.1); margin-left: 6px; padding-bottom: 12px; }
-        .bb-timeline-node::before { content: ''; position: absolute; left: -5px; top: 2px; width: 8px; height: 8px; border-radius: 50%; background: #38bdf8; }
-        .bb-timeline-node.alien::before { background: #ef4444; box-shadow: 0 0 8px #ef4444; }
-        .bb-timeline-time { font-size: 10px; color: #64748b; font-family: monospace; }
-        .bb-timeline-text { font-size: 12px; color: #e2e8f0; font-weight: 500; }
     `;
     document.head.appendChild(modalStyle);
 
@@ -1106,8 +997,8 @@
             <div class="bb-window">
                 <div class="bb-header">
                     <div class="bb-title">
-                        ⬛ BLACKBOX <span>// АУДИТ 5.1</span>
-                        <span class="bb-pvz-badge">${CURRENT_PVZ}</span>
+                        ⬛ BLACKBOX <span>// АУДИТ 5.2</span>
+                        <span class="bb-pvz-badge">${CURRENT_PVZ} (${DEVICE_ID})</span>
                     </div>
                     <div class="bb-tabs">
                         <button class="bb-tab-btn active" data-tab="sessions">Журнал смены</button>
@@ -1185,7 +1076,6 @@
         const sidebar = document.getElementById('bb-replay-sidebar');
         if (!container) return;
 
-        // 1. ЖУРНАЛ СМЕНЫ
         if (tab === 'sessions') {
             sidebar.style.display = 'flex';
             let sessions = externalDumpData ? externalDumpData.sessions : await dbGetAll('sessions');
@@ -1323,8 +1213,8 @@
                 const sh = container.querySelector('#bb-shelf-search').value.toLowerCase().trim();
 
                 const filtered = sessions.filter(s => {
-                    const matchQ = (s.clientName || '').toLowerCase().includes(q) || (s.clientId || '').toLowerCase().includes(q) ||
-                                   (s.pickupCode || '').toLowerCase().includes(q) ||
+                    const matchQ = (s.clientName || '').toLowerCase().includes(q) || (s.clientId || '').toLowerCase().includes(q) || 
+                                   (s.pickupCode || '').toLowerCase().includes(q) || 
                                    s.postings?.some(p => (p.barcode && p.barcode.toLowerCase().includes(q)) || p.allBarcodes?.some(b => b.includes(q)));
                     const matchShelf = !sh || (s.shelves || '').toLowerCase().includes(sh);
                     return matchQ && matchShelf;
@@ -1343,7 +1233,6 @@
             applyFilters();
         }
 
-        // 2. ПОИСК ПОТЕРЯШКИ
         if (tab === 'lookup') {
             sidebar.style.display = 'none';
             container.innerHTML = `
@@ -1388,7 +1277,6 @@
             };
         }
 
-        // 3. АНОМАЛИИ
         if (tab === 'aliens') {
             sidebar.style.display = 'none';
             const sessions = externalDumpData ? externalDumpData.sessions : await dbGetAll('sessions');
@@ -1421,7 +1309,6 @@
             `;
         }
 
-        // 4. БАЗА ДАННЫХ
         if (tab === 'storage') {
             sidebar.style.display = 'none';
             const sessions = await dbGetAll('sessions');
@@ -1436,34 +1323,13 @@
             }
 
             container.innerHTML = `
-                <div class="bb-stat-grid">
-                    <div class="bb-stat-card">
-                        <span class="bb-stat-title">Сессий в базе</span>
-                        <span class="bb-stat-value">${sessions.length}</span>
-                    </div>
-                    <div class="bb-stat-card">
-                        <span class="bb-stat-title">Сканов в реестре</span>
-                        <span class="bb-stat-value">${scans.length}</span>
-                    </div>
-                    <div class="bb-stat-card">
-                        <span class="bb-stat-title">Занято памяти</span>
-                        <span class="bb-stat-value">${usageMb} <span style="font-size: 14px; color: #94a3b8;">/ ${quotaMb} МБ</span></span>
-                        <div class="bb-progress-bar"><div class="bb-progress-fill" style="width: ${percent}%"></div></div>
-                    </div>
+                <div style="display: flex; flex-direction: column; gap: 10px; max-width: 500px;">
+                    <div style="font-size: 12px; color: #94a3b8;">Локальный ПК: <b>${DEVICE_ID}</b> (${CURRENT_PVZ})</div>
+                    <div style="font-size: 12px; color: #94a3b8;">Сессий в локальной базе: <b>${sessions.length}</b></div>
+                    <div style="font-size: 12px; color: #94a3b8;">Занято диска: <b>${usageMb} / ${quotaMb} МБ (${percent}%)</b></div>
+                    <button class="bb-btn" id="bb-change-pvz-btn" style="background:#0284c7; color:#fff; width: fit-content;">🏢 Сменить ПВЗ</button>
+                    ${ENABLE_DEV_PURGE ? `<button class="bb-btn bb-btn-danger" id="bb-purge-btn" style="width: fit-content; margin-top: 10px;">⚠️ Очистить локальную БД</button>` : ''}
                 </div>
-
-                <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-                    <button class="bb-btn" id="bb-export-json">💾 Экспорт JSON</button>
-                    <button class="bb-btn" id="bb-import-btn">📥 Слияние баз</button>
-                    <button class="bb-btn" id="bb-change-pvz-btn" style="background:#0284c7; color:#fff;">🏢 Сменить ПВЗ (${CURRENT_PVZ})</button>
-                    <input type="file" id="bb-import-file" accept=".json" style="display: none;">
-                </div>
-
-                ${ENABLE_DEV_PURGE ? `
-                <div style="margin-top: 24px; padding-top: 14px; border-top: 1px solid rgba(239, 68, 68, 0.2);">
-                    <button class="bb-btn bb-btn-danger" id="bb-purge-btn">⚠️ Очистить локальную базу данных (DEV)</button>
-                </div>` : ''}
-                <div id="bb-storage-status" style="font-size: 12px; color: #10b981; margin-top: 10px;"></div>
             `;
 
             container.querySelector('#bb-change-pvz-btn').onclick = () => {
@@ -1474,35 +1340,9 @@
                 }
             };
 
-            container.querySelector('#bb-export-json').onclick = () => {
-                const dump = { sessions, scans, exportedAt: Date.now() };
-                const a = document.createElement('a');
-                a.href = URL.createObjectURL(new Blob([JSON.stringify(dump, null, 2)], { type: 'application/json' }));
-                a.download = `blackbox_dump_${Date.now()}.json`;
-                a.click();
-            };
-
-            const fileInp = container.querySelector('#bb-import-file');
-            container.querySelector('#bb-import-btn').onclick = () => fileInp.click();
-
-            fileInp.onchange = (e) => {
-                const file = e.target.files[0];
-                if (!file) return;
-                const reader = new FileReader();
-                reader.onload = async (ev) => {
-                    try {
-                        const imported = JSON.parse(ev.target.result);
-                        if (Array.isArray(imported.sessions)) for (let s of imported.sessions) await dbPut('sessions', s);
-                        if (Array.isArray(imported.scans)) for (let sc of imported.scans) { delete sc.id; await dbPut('scans_history', sc); }
-                        container.querySelector('#bb-storage-status').textContent = '✅ Базы успешно объединены!';
-                    } catch (err) { container.querySelector('#bb-storage-status').textContent = '❌ Ошибка чтения файла дампа'; }
-                };
-                reader.readAsText(file);
-            };
-
             if (ENABLE_DEV_PURGE) {
                 container.querySelector('#bb-purge-btn').onclick = async () => {
-                    if (confirm('Стереть ВСЕ данные из базы? Восстановление будет невозможно.')) {
+                    if (confirm('Стереть ВСЕ данные из базы этого ПК?')) {
                         await clearEntireDB();
                         renderTabContent('storage');
                     }
@@ -1538,14 +1378,12 @@
                             <span class="bb-dom-tag-rm" data-rm-tag="${t.title}" title="Удалить">×</span>
                         </div>
                     `).join('')}
-                    <button type="button" class="bb-panel-tag-add" id="bb-replay-add-tag-btn">+ Добавить</button>
                 </div>
             </div>
 
             <div style="font-size: 12px; font-weight: 700; margin-top: 12px; color: #38bdf8;">Товары заказа (${session.postings?.length || 0}):</div>
             <div style="display: flex; flex-direction: column; gap: 6px;" id="bb-postings-list-wrap">
                 ${(session.postings || []).map(p => {
-                    const ib = p.inbound;
                     const scanStatusHtml = p.isScanned 
                         ? `<span style="color: #34d399; font-weight: 700;">✓ Пикнут в ${p.scannedTimeFormatted} (${p.scannedBy})</span>`
                         : `<span style="color: #f59e0b; font-weight: 600;">⚠ Не сканировался (выдан кликом)</span>`;
@@ -1565,16 +1403,8 @@
                                     ${p.status === 'issued' ? 'Выдан' : (p.status === 'annulated' ? 'Отказ (' + p.reasonText + ')' : 'На хранении')}
                                 </span>
                             </div>
-                            <!-- СТАТУС СКАНА И ПРИЕМКИ -->
                             <div style="margin-top: 5px; display: flex; flex-direction: column; gap: 3px; font-size: 10px;">
                                 <div>${scanStatusHtml}</div>
-                                <div class="bb-inbound-slot">
-                                    ${ib ? `
-                                        <div class="bb-posting-placement-badge">
-                                            📥 <b>${ib.text}</b> · ${ib.time} · <span style="opacity:0.7">${ib.operator}</span>
-                                        </div>
-                                    ` : `<div style="color: #475569;">История приемки синхронизируется...</div>`}
-                                </div>
                             </div>
                         </div>
                     `;
@@ -1603,16 +1433,6 @@
             };
         });
 
-        const addTagBtn = sidebar.querySelector('#bb-replay-add-tag-btn');
-        if (addTagBtn) {
-            addTagBtn.onclick = () => {
-                openTagCreatorModal(session.clientId, () => {
-                    renderSessionReplay(session);
-                    renderTabContent('sessions');
-                });
-            };
-        }
-
         if (hasCode) {
             sidebar.querySelector('#bb-reopen-order-btn').onclick = () => {
                 closeInspectorModal();
@@ -1622,11 +1442,12 @@
         }
     }
 
+    // Служебные циклы строго раз в 30 и 15 сек
     setInterval(sendDeviceHeartbeat, 30000);
-    setInterval(cloudSyncTagsPull, 8000);
+    setInterval(cloudSyncTagsPull, 15000);
     setInterval(checkRemoteAlerts, 10000);
 
-    // Фоллбэк-детектор завершения выдачи по кнопкам и смене URL
+    // Фоллбэк завершения
     document.addEventListener('click', (e) => {
         const btn = e.target.closest('button');
         if (!btn) return;
@@ -1642,7 +1463,6 @@
         }
     }, true);
 
-    // Детектор ухода со страницы сессии на /orders
     let lastUrlPath = window.location.pathname;
     setInterval(() => {
         const curPath = window.location.pathname;
