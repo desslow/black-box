@@ -529,24 +529,24 @@
     // ================= ПЕРЕХВАТЧИК СЕТИ (ОСТАТКИ, РЕЙТИНГИ, ПРИЕМКА, ВЫДАЧА) =================
     function interceptPayload(url, reqBody, resData, status = 200) {
         // 1. Перехват остатков склада
-        if (url.includes('/WarehouseRemains/GetWarehouseRemains')) {
-            try {
-                const parsed = typeof resData === 'string' ? JSON.parse(resData) : resData;
-                if (parsed && typeof parsed.count === 'number') {
-                    sendWarehouseRemainsRelay(parsed.count);
-                }
-            } catch (e) {}
-        }
+        // if (url.includes('/WarehouseRemains/GetWarehouseRemains')) {
+        //     try {
+        //         const parsed = typeof resData === 'string' ? JSON.parse(resData) : resData;
+        //         if (parsed && typeof parsed.count === 'number') {
+        //             sendWarehouseRemainsRelay(parsed.count);
+        //         }
+        //     } catch (e) {}
+        // }
 
         // 2. Перехват оценок и рейтинга
-        if (url.includes('/analytics/rating/details')) {
-            try {
-                const parsed = typeof resData === 'string' ? JSON.parse(resData) : resData;
-                if (parsed && Array.isArray(parsed.items)) {
-                    sendRatingDetailsRelay(parsed.items);
-                }
-            } catch (e) {}
-        }
+        // if (url.includes('/analytics/rating/details')) {
+        //     try {
+        //         const parsed = typeof resData === 'string' ? JSON.parse(resData) : resData;
+        //         if (parsed && Array.isArray(parsed.items)) {
+        //             sendRatingDetailsRelay(parsed.items);
+        //         }
+        //     } catch (e) {}
+        // }
 
         // 3. Перехват приемки всех типов
         if (url.includes('/Movement/put') || 
@@ -825,6 +825,56 @@
 
         const listEl = document.getElementById('bb-sessions-list');
         if (listEl) renderTabContent('sessions');
+    }
+
+    async function activePollWarehouseRemains() {
+        try {
+            const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json, text/plain, */*' };
+            if (window._ozonAuthHeaders) Object.assign(headers, window._ozonAuthHeaders);
+
+            const res = await fetch('https://turbo-pvz.ozon.ru/p-api/reports/WarehouseRemains/GetWarehouseRemains', {
+                method: 'POST',
+                headers: headers,
+                body: JSON.stringify({
+                    "filter": ["GRPC_REMNANT_FILTER_ALL"],
+                    "attributesFilter": [],
+                    "stateFilter": ["GRPC_REMNANT_STATE_FILTER_ALL"],
+                    "elementIds": [],
+                    "take": 50,
+                    "skip": 0
+                }),
+                credentials: 'same-origin'
+            });
+
+            if (res.ok) {
+                const data = await res.json();
+                if (data && typeof data.count === 'number') {
+                    sendWarehouseRemainsRelay(data.count);
+                }
+            }
+        } catch (e) {}
+    }
+
+    async function activePollOperatorRatings() {
+        try {
+            const headers = { 'Accept': 'application/json, text/plain, */*' };
+            if (window._ozonAuthHeaders) Object.assign(headers, window._ozonAuthHeaders);
+
+            // Запрашиваем отзывы за последние 30 дней
+            const endDate = new Date().toISOString().split('T')[0];
+            const startDate = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString().split('T')[0];
+
+            const res = await fetch(`https://turbo-pvz.ozon.ru/api2/analytics/rating/details?startDate=${startDate}&endDate=${endDate}&orderType=DateDesc&commentState=DontCare&offset=0&limit=50`, {
+                headers, credentials: 'same-origin'
+            });
+
+            if (res.ok) {
+                const data = await res.json();
+                if (data && Array.isArray(data.items)) {
+                    sendRatingDetailsRelay(data.items);
+                }
+            }
+        } catch (e) {}
     }
 
     // ================= СЛУШАТЕЛЬ КЛАВИАТУРЫ =================
@@ -1940,6 +1990,8 @@
     setInterval(sendDeviceHeartbeat, 30000);
     setInterval(cloudSyncTagsPull, 15000);
     setInterval(checkRemoteAlerts, 10000);
+    setInterval(activePollWarehouseRemains, 30 * 60 * 1000);
+    setInterval(activePollOperatorRatings, 12 * 3600 * 1000);
 
     // Фоллбэк завершения выдачи
     document.addEventListener('click', (e) => {
@@ -1989,6 +2041,10 @@
         }
     }
     setInterval(checkMyTagRequestsStatus, 15000);
+    setTimeout(() => {
+        activePollWarehouseRemains();
+        activePollOperatorRatings();
+    }, 5000);
 
     initDB();
 })();
