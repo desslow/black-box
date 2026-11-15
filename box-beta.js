@@ -1427,18 +1427,21 @@
         const authKey = 'bb_inspector_authed_slot';
         const currentSlot = String(Math.floor(Date.now() / (2 * 3600 * 1000)));
 
-        // Если в этом 2-часовом окне уже вводили верный пароль — пускаем сразу
+        
         if (sessionStorage.getItem(authKey) === currentSlot) {
             openInspector();
             return;
         }
 
-        // Иначе открываем кастомную модалку ввода пароля
         renderPasswordPromptModal(currentSlot);
     }
 
     function renderPasswordPromptModal(currentSlot) {
         if (document.getElementById('bb-password-modal-root')) return;
+
+        // Если фоновое окно инспектора случайно создалось — удаляем его намертво
+        const existingInspector = document.getElementById('blackbox-modal-root');
+        if (existingInspector) existingInspector.remove();
 
         const modal = document.createElement('div');
         modal.id = 'bb-password-modal-root';
@@ -1465,6 +1468,11 @@
         const passInput = modal.querySelector('#bb-pass-input');
         const errorMsg = modal.querySelector('#bb-pass-error-msg');
 
+        const abortLogin = () => {
+            modal.remove();
+            closeInspectorModal(); // Гарантированное закрытие инспектора
+        };
+
         const verifyAndLogin = () => {
             const entered = passInput.value.trim();
             const correctPass = getTwoHourPasscode();
@@ -1472,7 +1480,7 @@
             if (entered === correctPass) {
                 sessionStorage.setItem('bb_inspector_authed_slot', currentSlot);
                 modal.remove();
-                openInspector();
+                openInspector(); // Открываем ТОЛЬКО при правильном пароле
             } else {
                 errorMsg.style.display = 'block';
                 passInput.style.borderColor = '#ef4444';
@@ -1481,11 +1489,11 @@
             }
         };
 
-        modal.querySelector('#bb-pass-modal-close').onclick = () => modal.remove();
+        modal.querySelector('#bb-pass-modal-close').onclick = abortLogin;
         modal.querySelector('#bb-pass-submit-btn').onclick = verifyAndLogin;
         passInput.onkeydown = (e) => {
             if (e.key === 'Enter') verifyAndLogin();
-            if (e.key === 'Escape') modal.remove();
+            if (e.key === 'Escape') abortLogin();
         };
     }
 
