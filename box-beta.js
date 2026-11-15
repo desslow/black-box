@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ozon BlackBox
 // @namespace    http://tampermonkey.net/
-// @version      5.2
-// @description  Audit
+// @version      5.3
+// @description  -
 // @author       desslow
 // @match        https://turbo-pvz.ozon.ru/*
 // @run-at       document-start
@@ -13,10 +13,7 @@
 (function() {
     'use strict';
 
-    // СТРОГИЙ ГАРД: Работаем ТОЛЬКО в приложении ТурбоПВЗ, игнорируем любые мусорные фреймы
-    if (!window.location.hostname.includes('turbo-pvz.ozon.ru')) {
-        return;
-    }
+    if (!window.location.hostname.includes('turbo-pvz.ozon.ru')) return;
 
     const SUPABASE_URL = '';
     const SUPABASE_KEY = '';
@@ -25,7 +22,7 @@
     function getPvzId() {
         let saved = localStorage.getItem('bb_current_pvz');
         if (!saved || !PVZ_LIST.includes(saved)) {
-            saved = prompt(`[BlackBox 5.2] Выберите ПВЗ для этого компьютера:\n${PVZ_LIST.join(', ')}`, PVZ_LIST[0]);
+            saved = prompt(`[BlackBox 5.3] Выберите ПВЗ для этого ПК:\n${PVZ_LIST.join(', ')}`, PVZ_LIST[0]);
             if (!PVZ_LIST.includes(saved)) saved = PVZ_LIST[0];
             localStorage.setItem('bb_current_pvz', saved);
         }
@@ -33,7 +30,6 @@
     }
     const CURRENT_PVZ = getPvzId();
 
-    // ГЕНЕРАЦИЯ ПОНЯТНОГО И СТАБИЛЬНОГО DEVICE ID (НАПР: PVZ_2210-PC-4A8F)
     function getDeterministicDeviceId() {
         let dId = localStorage.getItem('bb_device_id_v2');
         if (!dId) {
@@ -99,13 +95,11 @@
         });
     }
 
-    // ================= НАДЕЖНЫЙ КОНТРОЛЬ АЛЕРТОВ (TTL + МОДАЛКА) =================
+    // Алерты с TTL
     function getDismissedAlerts() {
-        try {
-            return new Set(JSON.parse(localStorage.getItem('bb_dismissed_alerts_v2') || '[]'));
-        } catch (e) { return new Set(); }
+        try { return new Set(JSON.parse(localStorage.getItem('bb_dismissed_alerts_v2') || '[]')); }
+        catch (e) { return new Set(); }
     }
-
     function saveDismissedAlert(id) {
         const set = getDismissedAlerts();
         set.add(String(id));
@@ -113,24 +107,18 @@
     }
 
     async function checkRemoteAlerts() {
-        // Запрашиваем только активные алерты, у которых не истек срок жизни (TTL)
         const nowIso = new Date().toISOString();
         const query = `alerts?is_active=eq.true&expires_at=gt.${nowIso}&or=(target_scope.eq.ALL,and(target_scope.eq.PVZ,target_value.eq.${CURRENT_PVZ}),and(target_scope.eq.DEVICE,target_value.eq.${DEVICE_ID}))`;
         const alerts = await supabaseReq(query, 'GET');
-
         if (Array.isArray(alerts) && alerts.length > 0) {
             const dismissed = getDismissedAlerts();
-            // Находим первый алерт, который оператор на этом ПК еще не подтверждал
             const freshAlert = alerts.find(a => !dismissed.has(String(a.id)));
-            if (freshAlert) {
-                renderCentralAlertModal(freshAlert);
-            }
+            if (freshAlert) renderCentralAlertModal(freshAlert);
         }
     }
 
     function renderCentralAlertModal(alertObj) {
         if (document.getElementById(`bb-alert-modal-root`)) return;
-
         const modal = document.createElement('div');
         modal.id = `bb-alert-modal-root`;
         modal.innerHTML = `
@@ -142,16 +130,13 @@
                     </div>
                     <span class="bb-alert-scope-pill">${alertObj.target_scope === 'ALL' ? 'Вся сеть' : CURRENT_PVZ}</span>
                 </div>
-                <div class="bb-alert-body">
-                    ${alertObj.message}
-                </div>
+                <div class="bb-alert-body">${alertObj.message}</div>
                 <div class="bb-alert-foot">
                     <button class="bb-alert-btn" id="bb-dismiss-alert-btn">Ознакомлен</button>
                 </div>
             </div>
         `;
         document.body.appendChild(modal);
-
         modal.querySelector('#bb-dismiss-alert-btn').onclick = () => {
             saveDismissedAlert(alertObj.id);
             modal.remove();
@@ -199,25 +184,17 @@
         if (Array.isArray(cloudData)) {
             for (let item of cloudData) {
                 if (item.client_id) {
-                    await dbPut('client_tags', {
-                        clientId: String(item.client_id),
-                        tags: item.tags || []
-                    });
+                    await dbPut('client_tags', { clientId: String(item.client_id), tags: item.tags || [] });
                 }
             }
         }
     }
 
     async function cloudSyncTagPush(clientId, tags) {
-        const payload = {
-            client_id: String(clientId),
-            tags: tags || [],
-            updated_at: new Date().toISOString()
-        };
+        const payload = { client_id: String(clientId), tags: tags || [], updated_at: new Date().toISOString() };
         supabaseReq('client_tags?on_conflict=client_id', 'POST', payload);
     }
 
-    // ТЕЛЕМЕТРИЯ: Передаем честные данные строго из активного окна ТурбоПВЗ
     async function sendDeviceHeartbeat() {
         let usageMb = 0, quotaMb = 0, percent = 0;
         if (navigator.storage && navigator.storage.estimate) {
@@ -228,7 +205,6 @@
                 percent = Number(Math.min(100, (est.usage / est.quota) * 100).toFixed(2));
             } catch (e) {}
         }
-
         const payload = {
             device_id: DEVICE_ID,
             pvz_id: CURRENT_PVZ,
@@ -243,15 +219,93 @@
         supabaseReq('devices?on_conflict=device_id', 'POST', payload);
     }
 
+    // ================= НАДЕЖНЫЙ ПЕРЕХВАТ ПРИЕМКИ ТОВАРОВ =================
     function recordInboundRelay(barcode, cell, op) {
+        if (!barcode) return;
         const payload = {
             pvz_id: CURRENT_PVZ,
-            barcode: barcode || '—',
-            cell: cell || '—',
+            barcode: String(barcode).trim(),
+            cell: cell ? String(cell).trim() : 'Основная',
             operator: op || getOperatorLogin() || 'Склад',
             time: Date.now()
         };
         supabaseReq('inbounds', 'POST', payload);
+    }
+
+    function parseAndRecordInboundNetwork(data) {
+        if (!data) return;
+        // 1. Одиночные позиции
+        let address = data.targetAddress || data.shelfAddress || data.address || data.articlePositions?.[0]?.address || data.state?.address || data.article?.address || data.cell || '';
+        let barcode = data.barcode || data.articlePositions?.[0]?.barcode || data.state?.barcode || data.article?.barcode || data.article?.name || '';
+
+        if (barcode && address) {
+            recordInboundRelay(barcode, address, getOperatorLogin());
+            return;
+        }
+
+        // 2. Многоместная приемка / массив позиций
+        if (Array.isArray(data.articlePositions)) {
+            data.articlePositions.forEach(pos => {
+                if (pos.barcode && (pos.address || address)) {
+                    recordInboundRelay(pos.barcode, pos.address || address, getOperatorLogin());
+                }
+            });
+        }
+    }
+
+    // ================= ИСТОРИЯ ПРИЕМКИ ТОВАРА =================
+    async function fetchPostingInboundHistory(postingId) {
+        if (!postingId) return null;
+        const pIdStr = String(postingId);
+        if (postingsInboundCache.has(pIdStr)) return postingsInboundCache.get(pIdStr);
+
+        try {
+            const headers = {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'x-o3-app-name': 'turbo-pvz-ui'
+            };
+            if (window._ozonAuthHeaders) Object.assign(headers, window._ozonAuthHeaders);
+
+            const res = await fetch(`https://turbo-pvz.ozon.ru/api2/article-tracking/Entity/operation-history-v2?entityId=${pIdStr}&entityType=Article&entitySubType=ArticlePosting`, {
+                headers, credentials: 'same-origin'
+            });
+
+            if (res.ok) {
+                const data = await res.json();
+                const inboundInfo = extractPlacementFromHistory(data);
+                if (inboundInfo) {
+                    postingsInboundCache.set(pIdStr, inboundInfo);
+                    return inboundInfo;
+                }
+            }
+        } catch (e) {}
+
+        return { text: 'Принят на баланс', time: '—', operator: 'Склад' };
+    }
+
+    function extractPlacementFromHistory(historyData) {
+        if (!historyData || !Array.isArray(historyData.operationSteps)) return null;
+        for (let step of historyData.operationSteps) {
+            if (step.operationStepType === 'OnStore' && Array.isArray(step.operations)) {
+                for (let opGroup of step.operations) {
+                    if (Array.isArray(opGroup)) {
+                        for (let op of opGroup) {
+                            if (op.description && (op.description.includes('Разместили') || op.description.includes('Приняли на баланс'))) {
+                                const d = new Date(op.momentUtc);
+                                const timeStr = `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+                                return {
+                                    text: op.description.replace('Разместили в ячейку', 'Яч.').replace('Разместили', 'Размещен').trim(),
+                                    time: timeStr,
+                                    operator: (op.userName || '').replace('PVZ_', '').trim() || 'Склад'
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return null;
     }
 
     // ================= INDEXEDDB =================
@@ -420,15 +474,6 @@
         };
     }
 
-    function parseAndRecordInboundNetwork(data) {
-        if (!data) return;
-        let address = data.articlePositions?.[0]?.address || data.state?.address || data.article?.address || data.address || '';
-        let barcode = data.articlePositions?.[0]?.barcode || data.state?.barcode || data.article?.barcode || data.barcode || '';
-        if (barcode && address) {
-            recordInboundRelay(barcode, address, getOperatorLogin());
-        }
-    }
-
     function captureAuthToken(headersObj) {
         if (!headersObj) return;
         try {
@@ -444,8 +489,14 @@
         } catch (e) {}
     }
 
+    // ================= ПЕРЕХВАТЧИК СЕТИ =================
     function interceptPayload(url, reqBody, resData, status = 200) {
-        if (url.includes('/Movement/put') || url.includes('/clearing/articles/receive') || url.includes('/Resolver/GetResolveEntity')) {
+        // Ловим ВСЕ варианты приемки
+        if (url.includes('/Movement/put') || 
+            url.includes('/clearing/articles/receive') || 
+            url.includes('/Resolver/GetResolveEntity') ||
+            url.includes('/receive-by-cell') ||
+            url.includes('/clearing/postings/receive')) {
             try { parseAndRecordInboundNetwork(typeof resData === 'string' ? JSON.parse(resData) : resData); } catch (e) {}
         }
 
@@ -574,16 +625,13 @@
         let session = await dbGet('sessions', sId);
 
         let realCode = sessionStorage.getItem('client_code_' + sId) || sessionStorage.getItem('client_code_pending');
-        if (!realCode && session && session.pickupCode && !session.pickupCode.includes('----')) {
-            realCode = session.pickupCode;
-        }
+        if (!realCode && session && session.pickupCode && !session.pickupCode.includes('----')) realCode = session.pickupCode;
         if (!realCode && clientId) {
             const cachedByCid = sessionStorage.getItem('client_code_cid_' + clientId);
             if (cachedByCid) realCode = cachedByCid;
         }
 
         const currentCode = realCode || (clientId ? `${clientId}*----` : '');
-
         if (realCode && !realCode.includes('----')) {
             sessionStorage.setItem('client_code_' + sId, realCode);
             if (clientId) sessionStorage.setItem('client_code_cid_' + clientId, realCode);
@@ -614,6 +662,13 @@
         activeSession = session;
         await dbPut('sessions', session);
         cloudSyncSession(session);
+
+        // Фоновый предзагрузчик приемки
+        session.postings.forEach(p => {
+            fetchPostingInboundHistory(p.id).then(ib => {
+                if (ib) { p.inbound = ib; dbPut('sessions', session); }
+            });
+        });
     }
 
     async function finalizeActiveSession(sId, reason = 'completed') {
@@ -622,7 +677,6 @@
 
         let session = await dbGet('sessions', String(targetId));
         if (!session) return;
-
         if (session.closedAt && session.closeReason !== 'active') return;
 
         session.closedAt = Date.now();
@@ -693,15 +747,13 @@
         sessionGiveoutPayloads.delete(String(targetId));
         pendingGiveoutTasks.delete(String(targetId));
 
-        if (activeSession && String(activeSession.sessionId) === String(targetId)) {
-            activeSession = null;
-        }
+        if (activeSession && String(activeSession.sessionId) === String(targetId)) activeSession = null;
 
         const listEl = document.getElementById('bb-sessions-list');
         if (listEl) renderTabContent('sessions');
     }
 
-    // ================= ГЛОБАЛЬНЫЙ СЛУШАТЕЛЬ КЛАВИАТУРЫ И СКАНИРОВАНИЯ =================
+    // ================= ГЛОБАЛЬНЫЙ СЛУШАТЕЛЬ КЛАВИАТУРЫ =================
     window.addEventListener('keydown', function(e) {
         if (e.ctrlKey && e.shiftKey && e.altKey && e.code === 'KeyB') {
             e.preventDefault();
@@ -732,13 +784,15 @@
         }
     }, true);
 
+    // ================= ТОЧНЫЙ ПАРСИНГ И СОПОСТАВЛЕНИЕ СКАНЕРА =================
     async function processBarcodeScan(barcode) {
-        const clean = barcode.toLowerCase();
+        const clean = barcode.toLowerCase().trim();
         const now = Date.now();
         const activeId = getActiveSessionIdOnTab();
         const currentOp = (activeId && sessionStorage.getItem('session_operator_' + activeId)) || getOperatorLogin();
         let currentClientName = '';
 
+        // Штрихкод клиента
         const isClientBarcode = /^\d{5,12}\*\d{3,6}$/.test(clean);
         if (isClientBarcode) {
             const parts = clean.split('*');
@@ -764,11 +818,23 @@
             if (session) {
                 currentClientName = session.clientName || 'Без имени';
                 if (session.postings) {
+                    // Универсальный поиск: чистим КИЗы от префиксов (01), спецсимволов и хвостов
                     const targetPosting = session.postings.find(p => {
                         const pId = String(p.id).toLowerCase();
                         const pBar = (p.barcode || '').toLowerCase();
                         const bList = (p.allBarcodes || []).map(b => String(b).toLowerCase());
-                        return pId.includes(clean) || clean.includes(pId) || pBar.includes(clean) || clean.includes(pBar) || bList.some(b => b.includes(clean));
+
+                        // Точное вхождение или подстрока в обе стороны
+                        if (clean.includes(pId) || pId.includes(clean)) return true;
+                        if (pBar && (clean.includes(pBar) || pBar.includes(clean))) return true;
+                        if (bList.some(b => clean.includes(b) || b.includes(clean))) return true;
+
+                        // Очистка от префикса КИЗ 01
+                        if (clean.startsWith('01') && clean.length > 14) {
+                            const gtin = clean.slice(2, 16);
+                            if (pBar.includes(gtin) || bList.some(b => b.includes(gtin))) return true;
+                        }
+                        return false;
                     });
 
                     if (targetPosting) {
@@ -888,7 +954,7 @@
     }
     setInterval(injectDomTags, 400);
 
-    // ================= СТИЛИ ЧЕРНОГО ЯЩИКА И МОДАЛКИ АЛЕРТОВ =================
+    // ================= СТИЛИ ИНСПЕКТОРА BLACKBOX (ПОЛНЫЙ ВОССТАНОВЛЕННЫЙ CSS) =================
     const modalStyle = document.createElement('style');
     modalStyle.innerHTML = `
         #blackbox-modal-root {
@@ -898,7 +964,6 @@
             font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif !important; color: #f8fafc !important;
         }
 
-        /* ЦЕНТРАЛЬНАЯ СТРОГАЯ МОДАЛКА АЛЕРТА (НЕ СБИВАЕТ ОПЕРАТОРА) */
         #bb-alert-modal-root {
             position: fixed !important; top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important;
             background: rgba(2, 6, 23, 0.85) !important; backdrop-filter: blur(12px) !important;
@@ -949,9 +1014,31 @@
         .bb-input { background: rgba(255, 255, 255, 0.05) !important; border: 1px solid rgba(255, 255, 255, 0.12) !important; color: #fff !important; padding: 8px 12px !important; border-radius: 8px !important; font-size: 13px !important; outline: none !important; box-sizing: border-box !important; }
         .bb-input:focus { border-color: #38bdf8 !important; }
 
+        /* ВОССТАНОВЛЕННЫЕ СТИЛИ КАРТОЧЕК И КНОПОК ИНСПЕКТОРА */
         .bb-card { background: rgba(255, 255, 255, 0.03) !important; border: 1px solid rgba(255, 255, 255, 0.06) !important; border-radius: 10px !important; padding: 10px 12px !important; cursor: pointer !important; transition: all 0.15s !important; display: flex !important; flex-direction: column !important; gap: 5px !important; }
         .bb-card:hover { background: rgba(255, 255, 255, 0.06) !important; border-color: rgba(255, 255, 255, 0.15) !important; }
         .bb-card.has-alien { border-left: 3px solid #ef4444 !important; }
+
+        .bb-card-head { display: flex !important; justify-content: space-between !important; align-items: center !important; }
+        .bb-card-name { font-weight: 700; font-size: 13px; color: #f8fafc; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+        .bb-card-time { font-size: 11px; color: #64748b; font-family: monospace; }
+        .bb-card-sub { font-size: 12px; color: #94a3b8; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+        .bb-btn {
+            background: #1c3557 !important; color: #38bdf8 !important; border: 1px solid #2b4260 !important;
+            padding: 6px 12px !important; border-radius: 8px !important; font-size: 12px !important; font-weight: 600 !important;
+            cursor: pointer !important; transition: all 0.15s !important; display: inline-flex !important; align-items: center !important; gap: 5px !important;
+        }
+        .bb-btn:hover { background: #007aff !important; color: #fff !important; }
+        .bb-btn-danger { background: rgba(239, 68, 68, 0.15) !important; color: #f87171 !important; border-color: rgba(239, 68, 68, 0.3) !important; }
+        .bb-btn-danger:hover { background: #ef4444 !important; color: #fff !important; }
+
+        /* ПЛАШКА РАЗМЕЩЕНИЯ СО СКЛАДА */
+        .bb-posting-placement-badge {
+            background: rgba(16, 185, 129, 0.12) !important; border: 1px solid rgba(16, 185, 129, 0.3) !important;
+            color: #34d399 !important; padding: 2px 7px !important; border-radius: 6px !important; font-size: 10px !important;
+            margin-top: 4px !important; display: inline-flex !important; align-items: center !important; gap: 5px !important;
+        }
 
         .bb-dom-tag-badge {
             position: relative; padding: 3px 8px !important; border-radius: 6px !important; font-size: 12px !important;
@@ -997,7 +1084,7 @@
             <div class="bb-window">
                 <div class="bb-header">
                     <div class="bb-title">
-                        ⬛ BLACKBOX <span>// АУДИТ 5.2</span>
+                        ⬛ BLACKBOX <span>// АУДИТ 5.3</span>
                         <span class="bb-pvz-badge">${CURRENT_PVZ} (${DEVICE_ID})</span>
                     </div>
                     <div class="bb-tabs">
@@ -1141,70 +1228,37 @@
 
                         html += cardHtml;
                         if (node.children.length > 0) {
-                            html += `<div class="bb-thread-children">${renderTreeHtml(node.children)}</div>`;
+                            html += `<div class="tree-children" style="margin-left: 16px; padding-left: 10px; border-left: 2px solid rgba(255,255,255,0.12);">${renderTreeHtml(node.children)}</div>`;
                         }
                     }
                     return html;
                 }
 
-                const todayKey = formatDateKey(Date.now());
                 const sortedDays = Object.keys(grouped).sort((a,b) => currentSortOrder === 'desc' ? b.localeCompare(a) : a.localeCompare(b));
 
                 sortedDays.forEach(k => {
                     const groupItems = grouped[k];
                     const dateTitle = formatDateDivider(groupItems[0].foundAt);
-                    const isToday = (k === todayKey);
+                    const trees = buildSessionTrees(groupItems);
 
                     const wrapper = document.createElement('div');
+                    wrapper.innerHTML = `
+                        <div style="display:flex; justify-content:space-between; padding:6px 10px; margin-top:8px; background:rgba(56,189,248,0.06); border-radius:6px; font-size:11px; font-weight:bold; color:#38bdf8;">
+                            <span>📅 ${dateTitle}</span>
+                            <span style="opacity:0.6;">${groupItems.length} сессий</span>
+                        </div>
+                        <div style="display:flex; flex-direction:column; gap:6px; margin-top:4px;">${renderTreeHtml(trees)}</div>
+                    `;
 
-                    if (isToday) {
-                        const trees = buildSessionTrees(groupItems);
-                        wrapper.innerHTML = `
-                            <div class="bb-date-divider" style="cursor: default;">
-                                <span>📅 ${dateTitle}</span>
-                                <span style="opacity: 0.7; font-size: 11px;">${groupItems.length} сессий</span>
-                            </div>
-                            <div class="bb-tree-root">${renderTreeHtml(trees)}</div>
-                        `;
-                    } else {
-                        wrapper.innerHTML = `
-                            <details class="bb-day-accordion">
-                                <summary class="bb-date-divider">
-                                    <span>📅 ${dateTitle} ▾</span>
-                                    <span style="opacity: 0.7; font-size: 11px;">${groupItems.length} сессий</span>
-                                </summary>
-                                <div class="bb-tree-root" data-lazy-day="${k}" style="padding-top: 4px;">
-                                    <div style="color: #64748b; font-size: 11px; padding: 6px;">Нажмите, чтобы развернуть ветку...</div>
-                                </div>
-                            </details>
-                        `;
+                    wrapper.querySelectorAll('.bb-card').forEach(c => {
+                        c.onclick = (e) => {
+                            e.stopPropagation();
+                            const target = items.find(x => x.sessionId === c.dataset.sid);
+                            if (target) renderSessionReplay(target);
+                        };
+                    });
 
-                        const detailsEl = wrapper.querySelector('details');
-                        detailsEl.addEventListener('toggle', function() {
-                            if (detailsEl.open) {
-                                const targetRoot = detailsEl.querySelector('.bb-tree-root');
-                                if (!targetRoot.dataset.rendered) {
-                                    targetRoot.dataset.rendered = 'true';
-                                    const trees = buildSessionTrees(groupItems);
-                                    targetRoot.innerHTML = renderTreeHtml(trees);
-                                    attachCardClickHandlers(targetRoot, items);
-                                }
-                            }
-                        }, { once: true });
-                    }
-
-                    attachCardClickHandlers(wrapper, items);
                     listEl.appendChild(wrapper);
-                });
-            }
-
-            function attachCardClickHandlers(containerEl, items) {
-                containerEl.querySelectorAll('.bb-card').forEach(c => {
-                    c.onclick = (e) => {
-                        e.stopPropagation();
-                        const target = items.find(x => x.sessionId === c.dataset.sid);
-                        if (target) renderSessionReplay(target);
-                    };
                 });
             }
 
@@ -1224,7 +1278,6 @@
 
             container.querySelector('#bb-session-search').oninput = applyFilters;
             container.querySelector('#bb-shelf-search').oninput = applyFilters;
-
             container.querySelector('#bb-sort-toggle').onclick = () => {
                 currentSortOrder = currentSortOrder === 'desc' ? 'asc' : 'desc';
                 renderTabContent('sessions');
@@ -1351,6 +1404,7 @@
         }
     }
 
+    // ================= РЕКОНСТРУКЦИЯ С ПОЛНЫМИ СТИЛЯМИ =================
     async function renderSessionReplay(session) {
         const sidebar = document.getElementById('bb-replay-sidebar');
         if (!sidebar) return;
@@ -1371,22 +1425,23 @@
 
             <div style="margin-top: 10px; border-top: 1px solid rgba(255,255,255,0.08); padding-top: 8px;">
                 <div style="font-size: 11px; font-weight: 700; color: #94a3b8; text-transform: uppercase; margin-bottom: 6px;">Метки клиента:</div>
-                <div class="bb-client-tags-wrap" id="bb-replay-tags-wrap" style="margin-left: 0;">
-                    ${clientTags.map(t => `
+                <div class="bb-client-tags-wrap" id="bb-replay-tags-wrap" style="margin-left: 0; display:flex; gap:4px; flex-wrap:wrap;">
+                    ${clientTags.length ? clientTags.map(t => `
                         <div class="bb-dom-tag-badge color-${t.color || 'purple'}">
                             <span>${t.title}</span>
                             <span class="bb-dom-tag-rm" data-rm-tag="${t.title}" title="Удалить">×</span>
                         </div>
-                    `).join('')}
+                    `).join('') : '<span style="font-size:10px; color:#64748b;">Нет меток</span>'}
                 </div>
             </div>
 
             <div style="font-size: 12px; font-weight: 700; margin-top: 12px; color: #38bdf8;">Товары заказа (${session.postings?.length || 0}):</div>
             <div style="display: flex; flex-direction: column; gap: 6px;" id="bb-postings-list-wrap">
                 ${(session.postings || []).map(p => {
+                    const ib = p.inbound;
                     const scanStatusHtml = p.isScanned 
-                        ? `<span style="color: #34d399; font-weight: 700;">✓ Пикнут в ${p.scannedTimeFormatted} (${p.scannedBy})</span>`
-                        : `<span style="color: #f59e0b; font-weight: 600;">⚠ Не сканировался (выдан кликом)</span>`;
+                        ? `<span style="color: #34d399; font-weight: 700;">✓ Отсканирован в ${p.scannedTimeFormatted} (${p.scannedBy})</span>`
+                        : `<span style="color: #f59e0b; font-weight: 600;">⚠️ Не сканировался (выдан кликом)</span>`;
 
                     return `
                         <div style="font-size: 11px; background: rgba(255,255,255,0.02); padding: 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.05);" data-posting-card-id="${p.id}">
@@ -1405,6 +1460,13 @@
                             </div>
                             <div style="margin-top: 5px; display: flex; flex-direction: column; gap: 3px; font-size: 10px;">
                                 <div>${scanStatusHtml}</div>
+                                <div class="bb-inbound-slot">
+                                    ${ib ? `
+                                        <div class="bb-posting-placement-badge">
+                                            📥 <b>${ib.text}</b> · ${ib.time} · <span style="opacity:0.7">${ib.operator}</span>
+                                        </div>
+                                    ` : `<div style="color: #475569;">История приемки синхронизируется...</div>`}
+                                </div>
                             </div>
                         </div>
                     `;
@@ -1414,13 +1476,32 @@
             <div style="font-size: 12px; font-weight: 700; margin-top: 12px; color: #38bdf8;">Хронология событий:</div>
             <div style="display: flex; flex-direction: column; margin-top: 4px;">
                 ${(session.timeline || []).map(ev => `
-                    <div class="bb-timeline-node ${ev.isAlien ? 'alien' : ''}">
-                        <div class="bb-timeline-time">${new Date(ev.time).toLocaleTimeString()}</div>
-                        <div class="bb-timeline-text" style="${ev.isAlien ? 'color: #f87171; font-weight: bold;' : ''}">${ev.text}</div>
+                    <div style="position: relative; padding-left: 14px; border-left: 2px solid ${ev.isAlien ? '#ef4444' : '#38bdf8'}; margin-left: 4px; padding-bottom: 8px;">
+                        <div style="font-size: 10px; color: #64748b; font-family: monospace;">${new Date(ev.time).toLocaleTimeString()}</div>
+                        <div style="font-size: 12px; color: ${ev.isAlien ? '#f87171; font-weight: bold;' : '#e2e8f0;'}">${ev.text}</div>
                     </div>
                 `).join('')}
             </div>
         `;
+
+        // Предзагрузка истории приемок по товарам
+        (session.postings || []).forEach(async (p) => {
+            if (!p.inbound) {
+                const ib = await fetchPostingInboundHistory(p.id);
+                if (ib) {
+                    p.inbound = ib;
+                    await dbPut('sessions', session);
+                    const slot = sidebar.querySelector(`[data-posting-card-id="${p.id}"] .bb-inbound-slot`);
+                    if (slot) {
+                        slot.innerHTML = `
+                            <div class="bb-posting-placement-badge">
+                                📥 <b>${ib.text}</b> · ${ib.time} · <span style="opacity:0.7">${ib.operator}</span>
+                            </div>
+                        `;
+                    }
+                }
+            }
+        });
 
         sidebar.querySelectorAll('[data-rm-tag]').forEach(rm => {
             rm.onclick = async (e) => {
@@ -1442,12 +1523,12 @@
         }
     }
 
-    // Служебные циклы строго раз в 30 и 15 сек
+    // Служебные циклы
     setInterval(sendDeviceHeartbeat, 30000);
     setInterval(cloudSyncTagsPull, 15000);
     setInterval(checkRemoteAlerts, 10000);
 
-    // Фоллбэк завершения
+    // Фоллбэк завершения выдачи
     document.addEventListener('click', (e) => {
         const btn = e.target.closest('button');
         if (!btn) return;
