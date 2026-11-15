@@ -1103,6 +1103,81 @@
 
             alert('📨 Запрос на добавление метки отправлен руководству. После одобрения метка автоматически появится на всех ПВЗ.');
         };
+    }function openTagRequestModal(clientId, clientName) {
+        let ex = document.getElementById('bb-tag-request-modal');
+        if (ex) ex.remove();
+
+        let selectedColor = 'purple';
+
+        const modal = document.createElement('div');
+        modal.id = 'bb-tag-request-modal';
+        modal.innerHTML = `
+            <div class="bb-custom-modal-window">
+                <div class="bb-custom-modal-head">
+                    <span>Запрос метки для #${clientId}</span>
+                    <span class="bb-custom-modal-close" id="bb-req-modal-close">✕</span>
+                </div>
+                <div class="bb-custom-modal-body">
+                    <label>Название метки</label>
+                    <input type="text" id="bb-req-title-inp" placeholder="Скандалист, VIP, Проверяет..." autofocus>
+
+                    <label>Причина запроса (руководству)</label>
+                    <textarea id="bb-req-desc-inp" rows="3" placeholder="Опишите поведение клиента..."></textarea>
+
+                    <label>Категория</label>
+                    <div style="display:flex; gap:8px; align-items:center; margin-top:2px;" id="bb-req-colors-row">
+                        <span class="color-btn selected" data-color="purple" style="width:20px; height:20px; border-radius:50%; background:#c084fc; cursor:pointer; outline:2px solid #fff;"></span>
+                        <span class="color-btn" data-color="amber" style="width:20px; height:20px; border-radius:50%; background:#fbbf24; cursor:pointer;"></span>
+                        <span class="color-btn" data-color="red" style="width:20px; height:20px; border-radius:50%; background:#f87171; cursor:pointer;"></span>
+                        <span class="color-btn" data-color="emerald" style="width:20px; height:20px; border-radius:50%; background:#34d399; cursor:pointer;"></span>
+                    </div>
+                </div>
+                <div class="bb-custom-modal-foot">
+                    <button class="bb-btn" id="bb-req-send-btn" style="background:#005bff !important; color:#fff !important; padding:6px 16px;">Отправить запрос</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+
+        modal.querySelectorAll('#bb-req-colors-row .color-btn').forEach(btn => {
+            btn.onclick = () => {
+                modal.querySelectorAll('#bb-req-colors-row .color-btn').forEach(b => b.style.outline = 'none');
+                btn.style.outline = '2px solid #fff';
+                selectedColor = btn.dataset.color;
+            };
+        });
+
+        modal.querySelector('#bb-req-modal-close').onclick = () => modal.remove();
+        modal.querySelector('#bb-req-send-btn').onclick = async () => {
+            const title = modal.querySelector('#bb-req-title-inp').value.trim();
+            const desc = modal.querySelector('#bb-req-desc-inp').value.trim();
+
+            if (!title) {
+                modal.querySelector('#bb-req-title-inp').focus();
+                return;
+            }
+
+            modal.remove();
+
+            await supabaseReq('tag_requests', 'POST', {
+                pvz_id: CURRENT_PVZ,
+                device_id: DEVICE_ID,
+                operator: getOperatorLogin() || 'Оператор',
+                client_id: String(clientId),
+                client_name: clientName || '',
+                action: 'ADD',
+                tag_data: { title, desc, color: selectedColor },
+                status: 'PENDING'
+            });
+
+            // Ненавязчивое всплывающее подтверждение оператору
+            renderCentralAlertModal({
+                id: 'local_req_confirm',
+                title: 'Запрос передан руководству',
+                message: `Заявка на добавление метки "${title}" отправлена в управляющий центр. После одобрения она появится на всех филиалах.`,
+                target_scope: 'DEVICE'
+            });
+        };
     }
 
     
@@ -1115,6 +1190,119 @@
             background: rgba(2, 6, 23, 0.8) !important; backdrop-filter: blur(20px) saturate(180%) !important;
             z-index: 10000000 !important; display: flex !important; align-items: center !important; justify-content: center !important;
             font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif !important; color: #f8fafc !important;
+        }
+
+        .bb-dom-tag-add {
+            background: #ffffff !important;
+            color: #0f172a !important;
+            border: 1px solid #cbd5e1 !important;
+            padding: 3px 8px !important;
+            border-radius: 6px !important;
+            font-size: 11px !important;
+            font-weight: 700 !important;
+            cursor: pointer !important;
+            transition: all 0.15s ease !important;
+            display: inline-flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            line-height: 1 !important;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.05) !important;
+            user-select: none !important;
+            vertical-align: middle !important;
+        }
+        .bb-dom-tag-add:hover {
+            background: #f1f5f9 !important;
+            border-color: #94a3b8 !important;
+            color: #0284c7 !important;
+            transform: translateY(-1px) !important;
+        }
+        .bb-dom-tag-add:active {
+            transform: translateY(0) !important;
+        }
+
+        /* МОДАЛЬНЫЕ ОКНА: ВВОД ПАРОЛЯ И ЗАПРОС МЕТКИ (ЖЕСТКИЙ ФИКС СЕТКИ) */
+        #bb-password-modal-root, #bb-tag-request-modal {
+            position: fixed !important;
+            top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important;
+            background: rgba(2, 6, 23, 0.85) !important;
+            backdrop-filter: blur(12px) !important;
+            z-index: 10000005 !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif !important;
+        }
+
+        .bb-custom-modal-window {
+            background: #0f172a !important;
+            border: 1px solid rgba(255, 255, 255, 0.15) !important;
+            border-radius: 14px !important;
+            width: 400px !important;
+            max-width: 92vw !important;
+            box-shadow: 0 25px 60px rgba(0, 0, 0, 0.85) !important;
+            display: flex !important;
+            flex-direction: column !important;
+            overflow: hidden !important;
+            box-sizing: border-box !important;
+        }
+
+        .bb-custom-modal-head {
+            display: flex !important;
+            justify-content: space-between !important;
+            align-items: center !important;
+            padding: 12px 16px !important;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08) !important;
+            background: rgba(255, 255, 255, 0.02) !important;
+            font-size: 13px !important;
+            font-weight: 800 !important;
+            color: #f8fafc !important;
+        }
+        .bb-custom-modal-close {
+            cursor: pointer !important;
+            color: #64748b !important;
+            font-size: 16px !important;
+            font-weight: bold !important;
+            line-height: 1 !important;
+            padding: 2px 4px !important;
+        }
+        .bb-custom-modal-close:hover { color: #fff !important; }
+
+        .bb-custom-modal-body {
+            padding: 16px !important;
+            display: flex !important;
+            flex-direction: column !important;
+            gap: 10px !important;
+            box-sizing: border-box !important;
+        }
+        .bb-custom-modal-body label {
+            font-size: 10px !important;
+            font-weight: 700 !important;
+            text-transform: uppercase !important;
+            color: #94a3b8 !important;
+            letter-spacing: 0.5px !important;
+            margin-bottom: -4px !important;
+        }
+        .bb-custom-modal-body input, .bb-custom-modal-body textarea {
+            background: #1e293b !important;
+            border: 1px solid rgba(255, 255, 255, 0.12) !important;
+            color: #fff !important;
+            padding: 8px 12px !important;
+            border-radius: 8px !important;
+            font-size: 13px !important;
+            outline: none !important;
+            width: 100% !important;
+            box-sizing: border-box !important;
+        }
+        .bb-custom-modal-body input:focus, .bb-custom-modal-body textarea:focus {
+            border-color: #38bdf8 !important;
+        }
+
+        .bb-custom-modal-foot {
+            padding: 12px 16px !important;
+            border-top: 1px solid rgba(255, 255, 255, 0.08) !important;
+            display: flex !important;
+            justify-content: flex-end !important;
+            gap: 8px !important;
         }
 
         /* КАСТОМНЫЙ ТОНКИЙ СКРОЛЛБАР ВЕЗДЕ ВНУТРИ ИНСПЕКТОРА */
@@ -1239,20 +1427,66 @@
         const authKey = 'bb_inspector_authed_slot';
         const currentSlot = String(Math.floor(Date.now() / (2 * 3600 * 1000)));
 
+        // Если в этом 2-часовом окне уже вводили верный пароль — пускаем сразу
         if (sessionStorage.getItem(authKey) === currentSlot) {
             openInspector();
             return;
         }
 
-        const requiredPass = getTwoHourPasscode();
-        const inputPass = prompt('[BlackBox Security]\nВведите динамический пароль доступа из панели управления (действует 2 часа):');
-        
-        if (inputPass === requiredPass) {
-            sessionStorage.setItem(authKey, currentSlot);
-            openInspector();
-        } else if (inputPass !== null) {
-            alert('❌ Неверный пароль доступа!');
-        }
+        // Иначе открываем кастомную модалку ввода пароля
+        renderPasswordPromptModal(currentSlot);
+    }
+
+    function renderPasswordPromptModal(currentSlot) {
+        if (document.getElementById('bb-password-modal-root')) return;
+
+        const modal = document.createElement('div');
+        modal.id = 'bb-password-modal-root';
+        modal.innerHTML = `
+            <div class="bb-custom-modal-window">
+                <div class="bb-custom-modal-head">
+                    <span style="display:flex; align-items:center; gap:6px;">
+                        <span style="color:#38bdf8;">🔒</span> Вход в BlackBox
+                    </span>
+                    <span class="bb-custom-modal-close" id="bb-pass-modal-close">✕</span>
+                </div>
+                <div class="bb-custom-modal-body">
+                    <label>Динамический пароль доступа (2 часа)</label>
+                    <input type="password" id="bb-pass-input" placeholder="4-значный код из админки..." maxlength="8" autofocus autocomplete="off">
+                    <div id="bb-pass-error-msg" style="color:#ef4444; font-size:11px; font-weight:bold; display:none;">Неверный код доступа</div>
+                </div>
+                <div class="bb-custom-modal-foot">
+                    <button class="bb-btn" id="bb-pass-submit-btn" style="background:#005bff !important; color:#fff !important; padding:6px 16px;">Войти</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+
+        const passInput = modal.querySelector('#bb-pass-input');
+        const errorMsg = modal.querySelector('#bb-pass-error-msg');
+
+        const verifyAndLogin = () => {
+            const entered = passInput.value.trim();
+            const correctPass = getTwoHourPasscode();
+
+            if (entered === correctPass) {
+                sessionStorage.setItem('bb_inspector_authed_slot', currentSlot);
+                modal.remove();
+                openInspector();
+            } else {
+                errorMsg.style.display = 'block';
+                passInput.style.borderColor = '#ef4444';
+                passInput.value = '';
+                passInput.focus();
+            }
+        };
+
+        modal.querySelector('#bb-pass-modal-close').onclick = () => modal.remove();
+        modal.querySelector('#bb-pass-submit-btn').onclick = verifyAndLogin;
+        passInput.onkeydown = (e) => {
+            if (e.key === 'Enter') verifyAndLogin();
+            if (e.key === 'Escape') modal.remove();
+        };
     }
 
 
