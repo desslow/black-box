@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ozon BlackBox
 // @namespace    http://tampermonkey.net/
-// @version      5.3
+// @version      5.4
 // @description  -
 // @author       desslow
 // @match        https://turbo-pvz.ozon.ru/*
@@ -22,7 +22,7 @@
     function getPvzId() {
         let saved = localStorage.getItem('bb_current_pvz');
         if (!saved || !PVZ_LIST.includes(saved)) {
-            saved = prompt(`[BlackBox 5.3] Выберите ПВЗ для этого ПК:\n${PVZ_LIST.join(', ')}`, PVZ_LIST[0]);
+            saved = prompt(`[BlackBox 5.4] Выберите ПВЗ для этого компьютера:\n${PVZ_LIST.join(', ')}`, PVZ_LIST[0]);
             if (!PVZ_LIST.includes(saved)) saved = PVZ_LIST[0];
             localStorage.setItem('bb_current_pvz', saved);
         }
@@ -95,7 +95,6 @@
         });
     }
 
-    // Алерты с TTL
     function getDismissedAlerts() {
         try { return new Set(JSON.parse(localStorage.getItem('bb_dismissed_alerts_v2') || '[]')); }
         catch (e) { return new Set(); }
@@ -141,6 +140,38 @@
             saveDismissedAlert(alertObj.id);
             modal.remove();
         };
+    }
+
+    // Реле остатков на складе
+    function sendWarehouseRemainsRelay(count) {
+        if (count === null || count === undefined) return;
+        const payload = {
+            pvz_id: CURRENT_PVZ,
+            items_count: parseInt(count, 10) || 0,
+            updated_at: new Date().toISOString()
+        };
+        supabaseReq('warehouse_remains?on_conflict=pvz_id', 'POST', payload);
+    }
+
+    // Реле рейтингов и оценок (без themes)
+    function sendRatingDetailsRelay(items) {
+        if (!Array.isArray(items) || items.length === 0) return;
+        const payload = items.map(it => {
+            const opDate = it.operationDate || new Date().toISOString();
+            const uniqueId = `${CURRENT_PVZ}_${opDate}_${it.userAlias || 'none'}`.replace(/[^a-zA-Z0-9_-]/g, '_');
+            return {
+                id: uniqueId,
+                pvz_id: CURRENT_PVZ,
+                score: it.score || 5,
+                user_alias: (it.userAlias || '').replace('PVZ_', '').trim(),
+                comment: it.comment || '',
+                weight: Number(it.weight || 0),
+                claim: Boolean(it.claim),
+                operation_date: it.operationDate || null,
+                rating_date: it.date || null
+            };
+        });
+        supabaseReq('ratings_feed?on_conflict=id', 'POST', payload);
     }
 
     async function cloudSyncSession(session) {
@@ -219,7 +250,6 @@
         supabaseReq('devices?on_conflict=device_id', 'POST', payload);
     }
 
-    // ================= НАДЕЖНЫЙ ПЕРЕХВАТ ПРИЕМКИ ТОВАРОВ =================
     function recordInboundRelay(barcode, cell, op) {
         if (!barcode) return;
         const payload = {
@@ -234,7 +264,6 @@
 
     function parseAndRecordInboundNetwork(data) {
         if (!data) return;
-        // 1. Одиночные позиции
         let address = data.targetAddress || data.shelfAddress || data.address || data.articlePositions?.[0]?.address || data.state?.address || data.article?.address || data.cell || '';
         let barcode = data.barcode || data.articlePositions?.[0]?.barcode || data.state?.barcode || data.article?.barcode || data.article?.name || '';
 
@@ -243,7 +272,6 @@
             return;
         }
 
-        // 2. Многоместная приемка / массив позиций
         if (Array.isArray(data.articlePositions)) {
             data.articlePositions.forEach(pos => {
                 if (pos.barcode && (pos.address || address)) {
@@ -253,7 +281,6 @@
         }
     }
 
-    // ================= ИСТОРИЯ ПРИЕМКИ ТОВАРА =================
     async function fetchPostingInboundHistory(postingId) {
         if (!postingId) return null;
         const pIdStr = String(postingId);
@@ -281,7 +308,7 @@
             }
         } catch (e) {}
 
-        return { text: 'Принят на баланс', time: '—', operator: 'Склад' };
+        return { text: 'Принят на баланс пункта выдачи', time: '—', operator: 'Склад' };
     }
 
     function extractPlacementFromHistory(historyData) {
@@ -489,9 +516,29 @@
         } catch (e) {}
     }
 
-    // ================= ПЕРЕХВАТЧИК СЕТИ =================
+    // ================= ПЕРЕХВАТЧИК СЕТИ (ОСТАТКИ, РЕЙТИНГИ, ПРИЕМКА, ВЫДАЧА) =================
     function interceptPayload(url, reqBody, resData, status = 200) {
-        // Ловим ВСЕ варианты приемки
+        // 1. Перехват остатков склада
+        if (url.includes('/WarehouseRemains/GetWarehouseRemains')) {
+            try {
+                const parsed = typeof resData === 'string' ? JSON.parse(resData) : resData;
+                if (parsed && typeof parsed.count === 'number') {
+                    sendWarehouseRemainsRelay(parsed.count);
+                }
+            } catch (e) {}
+        }
+
+        // 2. Перехват оценок и рейтинга
+        if (url.includes('/analytics/rating/details')) {
+            try {
+                const parsed = typeof resData === 'string' ? JSON.parse(resData) : resData;
+                if (parsed && Array.isArray(parsed.items)) {
+                    sendRatingDetailsRelay(parsed.items);
+                }
+            } catch (e) {}
+        }
+
+        // 3. Перехват приемки всех типов
         if (url.includes('/Movement/put') || 
             url.includes('/clearing/articles/receive') || 
             url.includes('/Resolver/GetResolveEntity') ||
@@ -641,6 +688,19 @@
         const apiOperator = sessionStorage.getItem('session_operator_' + sId) || '';
         const postingsList = readyPostings.map(extractPostingDetails);
 
+        // Сохраняем флаги сканов, если они уже были в сессии
+        if (session && Array.isArray(session.postings)) {
+            postingsList.forEach(newP => {
+                const oldP = session.postings.find(x => String(x.id) === String(newP.id));
+                if (oldP && oldP.isScanned) {
+                    newP.isScanned = true;
+                    newP.scannedAt = oldP.scannedAt;
+                    newP.scannedTimeFormatted = oldP.scannedTimeFormatted;
+                    newP.scannedBy = oldP.scannedBy;
+                }
+            });
+        }
+
         if (!session) {
             session = {
                 sessionId: sId, clientId: String(clientId), clientName: clientName, pickupCode: currentCode,
@@ -656,14 +716,13 @@
             if (shelves) session.shelves = shelves;
             if (currentCode && !currentCode.includes('----')) session.pickupCode = currentCode;
             if (apiOperator) session.operator = apiOperator;
-            if (!session.postings || session.postings.length === 0) session.postings = postingsList;
+            session.postings = postingsList;
         }
 
         activeSession = session;
         await dbPut('sessions', session);
         cloudSyncSession(session);
 
-        // Фоновый предзагрузчик приемки
         session.postings.forEach(p => {
             fetchPostingInboundHistory(p.id).then(ib => {
                 if (ib) { p.inbound = ib; dbPut('sessions', session); }
@@ -671,6 +730,7 @@
         });
     }
 
+    // Финализация сессии без затирания флагов скана
     async function finalizeActiveSession(sId, reason = 'completed') {
         const targetId = sId ? String(sId) : (activeSession ? activeSession.sessionId : getActiveSessionIdOnTab());
         if (!targetId) return;
@@ -691,6 +751,10 @@
 
         session.postings.forEach(pObj => {
             const pIdStr = String(pObj.id);
+
+            // Если товар отсканирован в таймлайне, подтверждаем флаг
+            const wasScannedInTimeline = (session.timeline || []).some(t => t.type === 'scan' && t.postingId === pObj.id);
+            if (wasScannedInTimeline) pObj.isScanned = true;
 
             if (apiGiveoutData) {
                 if (apiGiveoutData.has(pIdStr)) {
@@ -753,7 +817,7 @@
         if (listEl) renderTabContent('sessions');
     }
 
-    // ================= ГЛОБАЛЬНЫЙ СЛУШАТЕЛЬ КЛАВИАТУРЫ =================
+    // ================= СЛУШАТЕЛЬ КЛАВИАТУРЫ =================
     window.addEventListener('keydown', function(e) {
         if (e.ctrlKey && e.shiftKey && e.altKey && e.code === 'KeyB') {
             e.preventDefault();
@@ -765,8 +829,6 @@
         if (e.key === 'Escape') {
             const modalRoot = document.getElementById('bb-alert-modal-root');
             if (modalRoot) { e.preventDefault(); e.stopPropagation(); modalRoot.remove(); return; }
-            const tModal = document.getElementById('bb-tag-creator-modal');
-            if (tModal) { e.preventDefault(); e.stopPropagation(); tModal.remove(); return; }
             const modal = document.getElementById('blackbox-modal-root');
             if (modal) { e.preventDefault(); e.stopPropagation(); closeInspectorModal(); return; }
         }
@@ -784,7 +846,7 @@
         }
     }, true);
 
-    // ================= ТОЧНЫЙ ПАРСИНГ И СОПОСТАВЛЕНИЕ СКАНЕРА =================
+    // ================= ТОЧНЫЙ ТРЕКИНГ СКАНЕРА =================
     async function processBarcodeScan(barcode) {
         const clean = barcode.toLowerCase().trim();
         const now = Date.now();
@@ -792,7 +854,6 @@
         const currentOp = (activeId && sessionStorage.getItem('session_operator_' + activeId)) || getOperatorLogin();
         let currentClientName = '';
 
-        // Штрихкод клиента
         const isClientBarcode = /^\d{5,12}\*\d{3,6}$/.test(clean);
         if (isClientBarcode) {
             const parts = clean.split('*');
@@ -818,18 +879,15 @@
             if (session) {
                 currentClientName = session.clientName || 'Без имени';
                 if (session.postings) {
-                    // Универсальный поиск: чистим КИЗы от префиксов (01), спецсимволов и хвостов
                     const targetPosting = session.postings.find(p => {
                         const pId = String(p.id).toLowerCase();
                         const pBar = (p.barcode || '').toLowerCase();
                         const bList = (p.allBarcodes || []).map(b => String(b).toLowerCase());
 
-                        // Точное вхождение или подстрока в обе стороны
                         if (clean.includes(pId) || pId.includes(clean)) return true;
                         if (pBar && (clean.includes(pBar) || pBar.includes(clean))) return true;
                         if (bList.some(b => clean.includes(b) || b.includes(clean))) return true;
 
-                        // Очистка от префикса КИЗ 01
                         if (clean.startsWith('01') && clean.length > 14) {
                             const gtin = clean.slice(2, 16);
                             if (pBar.includes(gtin) || bList.some(b => b.includes(gtin))) return true;
@@ -842,6 +900,7 @@
                         const nowTs = Date.now();
                         const timeStr = new Date(nowTs).toLocaleTimeString('ru-RU');
 
+                        // Фиксируем флаг скана в объекте товара
                         targetPosting.isScanned = true;
                         targetPosting.scannedAt = nowTs;
                         targetPosting.scannedTimeFormatted = timeStr;
@@ -924,7 +983,6 @@
 
         async function renderDomTags() {
             const tags = await getClientTags(clientId);
-
             wrap.innerHTML = tags.map(t => {
                 const dateStr = new Date(t.date || Date.now()).toLocaleDateString('ru-RU');
                 return `
@@ -954,7 +1012,7 @@
     }
     setInterval(injectDomTags, 400);
 
-    // ================= СТИЛИ ИНСПЕКТОРА BLACKBOX (ПОЛНЫЙ ВОССТАНОВЛЕННЫЙ CSS) =================
+    // ================= СТИЛИ ИНСПЕКТОРА С ТОНКИМ СКРОЛЛБАРОМ =================
     const modalStyle = document.createElement('style');
     modalStyle.innerHTML = `
         #blackbox-modal-root {
@@ -963,6 +1021,12 @@
             z-index: 10000000 !important; display: flex !important; align-items: center !important; justify-content: center !important;
             font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif !important; color: #f8fafc !important;
         }
+
+        /* КАСТОМНЫЙ ТОНКИЙ СКРОЛЛБАР ВЕЗДЕ ВНУТРИ ИНСПЕКТОРА */
+        #blackbox-modal-root *::-webkit-scrollbar { width: 4px !important; height: 4px !important; }
+        #blackbox-modal-root *::-webkit-scrollbar-track { background: transparent !important; }
+        #blackbox-modal-root *::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.16) !important; border-radius: 4px !important; }
+        #blackbox-modal-root *::-webkit-scrollbar-thumb:hover { background: rgba(56, 189, 248, 0.45) !important; }
 
         #bb-alert-modal-root {
             position: fixed !important; top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important;
@@ -1014,7 +1078,6 @@
         .bb-input { background: rgba(255, 255, 255, 0.05) !important; border: 1px solid rgba(255, 255, 255, 0.12) !important; color: #fff !important; padding: 8px 12px !important; border-radius: 8px !important; font-size: 13px !important; outline: none !important; box-sizing: border-box !important; }
         .bb-input:focus { border-color: #38bdf8 !important; }
 
-        /* ВОССТАНОВЛЕННЫЕ СТИЛИ КАРТОЧЕК И КНОПОК ИНСПЕКТОРА */
         .bb-card { background: rgba(255, 255, 255, 0.03) !important; border: 1px solid rgba(255, 255, 255, 0.06) !important; border-radius: 10px !important; padding: 10px 12px !important; cursor: pointer !important; transition: all 0.15s !important; display: flex !important; flex-direction: column !important; gap: 5px !important; }
         .bb-card:hover { background: rgba(255, 255, 255, 0.06) !important; border-color: rgba(255, 255, 255, 0.15) !important; }
         .bb-card.has-alien { border-left: 3px solid #ef4444 !important; }
@@ -1033,11 +1096,10 @@
         .bb-btn-danger { background: rgba(239, 68, 68, 0.15) !important; color: #f87171 !important; border-color: rgba(239, 68, 68, 0.3) !important; }
         .bb-btn-danger:hover { background: #ef4444 !important; color: #fff !important; }
 
-        /* ПЛАШКА РАЗМЕЩЕНИЯ СО СКЛАДА */
         .bb-posting-placement-badge {
             background: rgba(16, 185, 129, 0.12) !important; border: 1px solid rgba(16, 185, 129, 0.3) !important;
-            color: #34d399 !important; padding: 2px 7px !important; border-radius: 6px !important; font-size: 10px !important;
-            margin-top: 4px !important; display: inline-flex !important; align-items: center !important; gap: 5px !important;
+            color: #34d399 !important; padding: 3px 8px !important; border-radius: 6px !important; font-size: 10px !important;
+            margin-top: 5px !important; display: inline-flex !important; align-items: center !important; gap: 6px !important;
         }
 
         .bb-dom-tag-badge {
@@ -1084,7 +1146,7 @@
             <div class="bb-window">
                 <div class="bb-header">
                     <div class="bb-title">
-                        ⬛ BLACKBOX <span>// АУДИТ 5.3</span>
+                        ⬛ BLACKBOX <span>// АУДИТ 5.4</span>
                         <span class="bb-pvz-badge">${CURRENT_PVZ} (${DEVICE_ID})</span>
                     </div>
                     <div class="bb-tabs">
@@ -1404,7 +1466,7 @@
         }
     }
 
-    // ================= РЕКОНСТРУКЦИЯ С ПОЛНЫМИ СТИЛЯМИ =================
+    // ================= РЕКОНСТРУКЦИЯ С ТОЧНЫМ СТАТУСОМ СКАНА =================
     async function renderSessionReplay(session) {
         const sidebar = document.getElementById('bb-replay-sidebar');
         if (!sidebar) return;
@@ -1439,8 +1501,13 @@
             <div style="display: flex; flex-direction: column; gap: 6px;" id="bb-postings-list-wrap">
                 ${(session.postings || []).map(p => {
                     const ib = p.inbound;
-                    const scanStatusHtml = p.isScanned 
-                        ? `<span style="color: #34d399; font-weight: 700;">✓ Отсканирован в ${p.scannedTimeFormatted} (${p.scannedBy})</span>`
+
+                    // ПРОВЕРКА СКАНА: из объекта товара ИЛИ из таймлайна
+                    const isPhysicallyScanned = p.isScanned || (session.timeline || []).some(t => t.type === 'scan' && t.postingId === p.id);
+                    const scanTimeText = p.scannedTimeFormatted || (session.timeline || []).find(t => t.type === 'scan' && t.postingId === p.id)?.time ? new Date((session.timeline || []).find(t => t.type === 'scan' && t.postingId === p.id).time).toLocaleTimeString() : '';
+
+                    const scanStatusHtml = isPhysicallyScanned 
+                        ? `<span style="color: #34d399; font-weight: 700;">✓ Отсканирован${scanTimeText ? ' в ' + scanTimeText : ''} (${p.scannedBy || session.operator})</span>`
                         : `<span style="color: #f59e0b; font-weight: 600;">⚠️ Не сканировался (выдан кликом)</span>`;
 
                     return `
@@ -1465,7 +1532,7 @@
                                         <div class="bb-posting-placement-badge">
                                             📥 <b>${ib.text}</b> · ${ib.time} · <span style="opacity:0.7">${ib.operator}</span>
                                         </div>
-                                    ` : `<div style="color: #475569;">История приемки синхронизируется...</div>`}
+                                    ` : `<div style="color: #475569;">Загрузка истории приемки...</div>`}
                                 </div>
                             </div>
                         </div>
@@ -1484,7 +1551,6 @@
             </div>
         `;
 
-        // Предзагрузка истории приемок по товарам
         (session.postings || []).forEach(async (p) => {
             if (!p.inbound) {
                 const ib = await fetchPostingInboundHistory(p.id);
@@ -1523,7 +1589,7 @@
         }
     }
 
-    // Служебные циклы
+    // Фоновые служебные циклы
     setInterval(sendDeviceHeartbeat, 30000);
     setInterval(cloudSyncTagsPull, 15000);
     setInterval(checkRemoteAlerts, 10000);
