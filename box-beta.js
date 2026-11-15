@@ -1600,7 +1600,7 @@
         if (!btn) return;
         const txt = btn.textContent.trim();
 
-        if (txt === 'Выдать' || txt.startsWith('Выдать ') || txt === 'Завершить' || txt.startsWith('Завершить ')) {
+        if (txt === 'Выдать' || txt.startsWith('Выдать ') || txt.startsWith('Провести ') || txt === 'Завершить' || txt.startsWith('Завершить ')) {
             const activeId = getActiveSessionIdOnTab();
             if (activeId) {
                 setTimeout(() => {
