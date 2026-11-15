@@ -62,6 +62,16 @@
     const sessionGiveoutPayloads = new Map();
 
     const TAB_ID = Math.random().toString(36).slice(2, 9);
+    function getTwoHourPasscode() {
+        const slot = Math.floor(Date.now() / (2 * 3600 * 1000));
+        let hash = 0;
+        const str = slot + "_blackbox_pvz_secret_salt";
+        for (let i = 0; i < str.length; i++) {
+            hash = ((hash << 5) - hash) + str.charCodeAt(i);
+            hash |= 0;
+        }
+        return String(Math.abs(hash) % 9000 + 1000);
+    }
     const RUS_TO_ENG = {
         'й':'q','ц':'w','у':'e','к':'r','е':'t','н':'y','г':'u','ш':'i','щ':'o','з':'p',
         'х':'[','ъ':']','ф':'a','ы':'s','в':'d','а':'f','п':'g','р':'h','о':'j','л':'k',
@@ -983,12 +993,14 @@
 
         async function renderDomTags() {
             const tags = await getClientTags(clientId);
+            const clientName = nameEl.textContent.trim();
+
             wrap.innerHTML = tags.map(t => {
                 const dateStr = new Date(t.date || Date.now()).toLocaleDateString('ru-RU');
                 return `
                     <div class="bb-dom-tag-badge color-${t.color || 'purple'}">
                         <span>${t.title}</span>
-                        <span class="bb-dom-tag-rm" data-tag="${t.title}" title="Удалить метку">×</span>
+                        <span class="bb-dom-tag-rm" data-tag="${t.title}" title="Запросить удаление метки">×</span>
                         <div class="bb-tag-tooltip">
                             <div class="bb-tt-title">${t.title}</div>
                             ${t.desc ? `<div class="bb-tt-desc">${t.desc}</div>` : ''}
@@ -996,21 +1008,104 @@
                         </div>
                     </div>
                 `;
-            }).join('');
+            }).join('') + `<button type="button" class="bb-dom-tag-add" id="bb-request-add-tag-btn">+ Метка</button>`;
 
+            // Запрос на УДАЛЕНИЕ через сервер
             wrap.querySelectorAll('.bb-dom-tag-rm').forEach(rm => {
                 rm.onclick = async (e) => {
                     e.stopPropagation();
-                    if (confirm(`Удалить метку "${rm.dataset.tag}"?`)) {
-                        await removeClientTag(clientId, rm.dataset.tag);
-                        renderDomTags();
+                    if (confirm(`Отправить запрос руководству на снятие метки "${rm.dataset.tag}"?`)) {
+                        await supabaseReq('tag_requests', 'POST', {
+                            pvz_id: CURRENT_PVZ,
+                            device_id: DEVICE_ID,
+                            operator: getOperatorLogin() || 'Оператор',
+                            client_id: String(clientId),
+                            client_name: clientName,
+                            action: 'REMOVE',
+                            tag_data: { title: rm.dataset.tag },
+                            status: 'PENDING'
+                        });
+                        alert('📨 Запрос на снятие метки передан руководству в панель управления.');
                     }
                 };
             });
+
+            // Запрос на ДОБАВЛЕНИЕ через сервер
+            const addBtn = wrap.querySelector('#bb-request-add-tag-btn');
+            if (addBtn) {
+                addBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    openTagRequestModal(clientId, clientName);
+                };
+            }
         }
         renderDomTags();
     }
     setInterval(injectDomTags, 400);
+
+    function openTagRequestModal(clientId, clientName) {
+        let ex = document.getElementById('bb-tag-request-modal');
+        if (ex) ex.remove();
+
+        const modal = document.createElement('div');
+        modal.id = 'bb-tag-request-modal';
+        modal.innerHTML = `
+            <div class="bb-tag-dialog">
+                <div class="bb-tag-dialog-head">
+                    <span>Запрос метки для клиента: <b>#${clientId}</b></span>
+                    <span class="bb-tag-dialog-close" id="bb-req-cancel">✕</span>
+                </div>
+                <div class="bb-tag-dialog-body">
+                    <label class="bb-tag-label">Название метки</label>
+                    <input type="text" class="bb-input" id="bb-req-title-inp" placeholder="Скандалист, Проверяет всё, VIP..." autofocus>
+
+                    <label class="bb-tag-label">Причина (заметка руководству)</label>
+                    <textarea class="bb-input" id="bb-req-desc-inp" rows="2" placeholder="Опишите ситуацию с клиентом..."></textarea>
+
+                    <label class="bb-tag-label">Цвет</label>
+                    <div class="bb-tag-colors">
+                        <label class="bb-color-opt"><input type="radio" name="tagReqColor" value="purple" checked><span class="bb-color-dot" style="background:#a855f7;"></span><span>Фиолетовый</span></label>
+                        <label class="bb-color-opt"><input type="radio" name="tagReqColor" value="amber"><span class="bb-color-dot" style="background:#f59e0b;"></span><span>Оранжевый</span></label>
+                        <label class="bb-color-opt"><input type="radio" name="tagReqColor" value="red"><span class="bb-color-dot" style="background:#ef4444;"></span><span>Красный</span></label>
+                        <label class="bb-color-opt"><input type="radio" name="tagReqColor" value="emerald"><span class="bb-color-dot" style="background:#10b981;"></span><span>Зеленый</span></label>
+                    </div>
+                </div>
+                <div class="bb-tag-dialog-foot">
+                    <button class="bb-btn-save-tag" id="bb-req-send-btn">Отправить запрос</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+
+        modal.querySelector('#bb-req-cancel').onclick = () => modal.remove();
+        modal.querySelector('#bb-req-send-btn').onclick = async () => {
+            const title = modal.querySelector('#bb-req-title-inp').value.trim();
+            const desc = modal.querySelector('#bb-req-desc-inp').value.trim();
+            const color = modal.querySelector('input[name="tagReqColor"]:checked').value;
+
+            if (!title) {
+                modal.querySelector('#bb-req-title-inp').focus();
+                return;
+            }
+
+            modal.remove();
+
+            await supabaseReq('tag_requests', 'POST', {
+                pvz_id: CURRENT_PVZ,
+                device_id: DEVICE_ID,
+                operator: getOperatorLogin() || 'Оператор',
+                client_id: String(clientId),
+                client_name: clientName || '',
+                action: 'ADD',
+                tag_data: { title, desc, color },
+                status: 'PENDING'
+            });
+
+            alert('📨 Запрос на добавление метки отправлен руководству. После одобрения метка автоматически появится на всех ПВЗ.');
+        };
+    }
+
+    
 
     // ================= СТИЛИ ИНСПЕКТОРА С ТОНКИМ СКРОЛЛБАРОМ =================
     const modalStyle = document.createElement('style');
@@ -1128,54 +1223,38 @@
     `;
     document.head.appendChild(modalStyle);
 
-    function toggleInspectorModal() {
-        let m = document.getElementById('blackbox-modal-root');
-        if (m) closeInspectorModal(); else openInspector();
-    }
     function closeInspectorModal() {
         const m = document.getElementById('blackbox-modal-root');
         if (m) m.remove();
         document.body.style.overflow = '';
     }
 
-    function openInspector() {
-        document.body.style.overflow = 'hidden';
-        const modal = document.createElement('div');
-        modal.id = 'blackbox-modal-root';
-        modal.innerHTML = `
-            <div class="bb-window">
-                <div class="bb-header">
-                    <div class="bb-title">
-                        ⬛ BLACKBOX <span>// АУДИТ 5.4</span>
-                        <span class="bb-pvz-badge">${CURRENT_PVZ} (${DEVICE_ID})</span>
-                    </div>
-                    <div class="bb-tabs">
-                        <button class="bb-tab-btn active" data-tab="sessions">Журнал смены</button>
-                        <button class="bb-tab-btn" data-tab="lookup">Поиск «Потеряшки»</button>
-                        <button class="bb-tab-btn" data-tab="aliens">⚠️ Аномалии</button>
-                        <button class="bb-tab-btn" data-tab="storage">База данных</button>
-                    </div>
-                    <span class="bb-close" id="bb-close-btn">✕</span>
-                </div>
-                <div class="bb-body">
-                    <div class="bb-main-view" id="bb-main-content"></div>
-                    <div class="bb-replay-view" id="bb-replay-sidebar"><div style="color: #64748b; text-align: center; margin-top: 40px;">Выберите сессию для реконструкции</div></div>
-                </div>
-            </div>
-        `;
-        document.body.appendChild(modal);
-        modal.querySelector('#bb-close-btn').onclick = closeInspectorModal;
+    function toggleInspectorModal() {
+        let m = document.getElementById('blackbox-modal-root');
+        if (m) {
+            closeInspectorModal();
+            return;
+        }
 
-        const tabs = modal.querySelectorAll('.bb-tab-btn');
-        tabs.forEach(t => {
-            t.onclick = () => {
-                tabs.forEach(tb => tb.classList.remove('active'));
-                t.classList.add('active');
-                renderTabContent(t.dataset.tab);
-            };
-        });
-        renderTabContent('sessions');
+        const authKey = 'bb_inspector_authed_slot';
+        const currentSlot = String(Math.floor(Date.now() / (2 * 3600 * 1000)));
+
+        if (sessionStorage.getItem(authKey) === currentSlot) {
+            openInspector();
+            return;
+        }
+
+        const requiredPass = getTwoHourPasscode();
+        const inputPass = prompt('[BlackBox Security]\nВведите динамический пароль доступа из панели управления (действует 2 часа):');
+        
+        if (inputPass === requiredPass) {
+            sessionStorage.setItem(authKey, currentSlot);
+            openInspector();
+        } else if (inputPass !== null) {
+            alert('❌ Неверный пароль доступа!');
+        }
     }
+
 
     function formatDateKey(timestamp) {
         const d = new Date(timestamp);
@@ -1296,30 +1375,56 @@
                     return html;
                 }
 
+                const todayKey = formatDateKey(Date.now());
                 const sortedDays = Object.keys(grouped).sort((a,b) => currentSortOrder === 'desc' ? b.localeCompare(a) : a.localeCompare(b));
 
                 sortedDays.forEach(k => {
                     const groupItems = grouped[k];
                     const dateTitle = formatDateDivider(groupItems[0].foundAt);
-                    const trees = buildSessionTrees(groupItems);
+                    const isToday = (k === todayKey);
 
                     const wrapper = document.createElement('div');
-                    wrapper.innerHTML = `
-                        <div style="display:flex; justify-content:space-between; padding:6px 10px; margin-top:8px; background:rgba(56,189,248,0.06); border-radius:6px; font-size:11px; font-weight:bold; color:#38bdf8;">
-                            <span>📅 ${dateTitle}</span>
-                            <span style="opacity:0.6;">${groupItems.length} сессий</span>
-                        </div>
-                        <div style="display:flex; flex-direction:column; gap:6px; margin-top:4px;">${renderTreeHtml(trees)}</div>
-                    `;
 
-                    wrapper.querySelectorAll('.bb-card').forEach(c => {
-                        c.onclick = (e) => {
-                            e.stopPropagation();
-                            const target = items.find(x => x.sessionId === c.dataset.sid);
-                            if (target) renderSessionReplay(target);
-                        };
-                    });
+                    // СЕГОДНЯ: Открыто сразу со всеми сессиями
+                    if (isToday) {
+                        const trees = buildSessionTrees(groupItems);
+                        wrapper.innerHTML = `
+                            <div style="display:flex; justify-content:space-between; padding:6px 10px; margin-top:8px; background:rgba(56,189,248,0.06); border-radius:6px; font-size:11px; font-weight:bold; color:#38bdf8;">
+                                <span>📅 ${dateTitle}</span>
+                                <span style="opacity:0.6;">${groupItems.length} сессий</span>
+                            </div>
+                            <div style="display:flex; flex-direction:column; gap:6px; margin-top:4px;">${renderTreeHtml(trees)}</div>
+                        `;
+                    } 
+                    // ВСЕ ОСТАЛЬНЫЕ ДНИ: Полностью скрыты в аккордеон, строятся строго по первому клику
+                    else {
+                        wrapper.innerHTML = `
+                            <details class="bb-day-accordion" style="margin-top:6px;">
+                                <summary style="cursor:pointer; display:flex; justify-content:space-between; padding:6px 10px; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.06); border-radius:6px; font-size:11px; font-weight:bold; color:#94a3b8; user-select:none;">
+                                    <span>📅 ${dateTitle} ▾ (Скрыто)</span>
+                                    <span style="opacity:0.6;">${groupItems.length} сессий</span>
+                                </summary>
+                                <div class="bb-tree-root-lazy" style="display:flex; flex-direction:column; gap:6px; margin-top:4px; padding-left:4px;">
+                                    <div style="font-size:11px; color:#64748b; padding:6px;">Нажмите, чтобы развернуть дерево...</div>
+                                </div>
+                            </details>
+                        `;
 
+                        const detailsEl = wrapper.querySelector('details');
+                        detailsEl.addEventListener('toggle', function() {
+                            if (detailsEl.open) {
+                                const targetContainer = detailsEl.querySelector('.bb-tree-root-lazy');
+                                if (!targetContainer.dataset.loaded) {
+                                    targetContainer.dataset.loaded = 'true';
+                                    const trees = buildSessionTrees(groupItems);
+                                    targetContainer.innerHTML = renderTreeHtml(trees);
+                                    attachCardClickHandlers(targetContainer, items);
+                                }
+                            }
+                        }, { once: true });
+                    }
+
+                    attachCardClickHandlers(wrapper, items);
                     listEl.appendChild(wrapper);
                 });
             }
@@ -1621,6 +1726,27 @@
         }
         lastUrlPath = curPath;
     }, 300);
+
+    async function checkMyTagRequestsStatus() {
+        const query = `tag_requests?device_id=eq.${DEVICE_ID}&status=neq.PENDING&resolved_at=gt.${new Date(Date.now() - 60000).toISOString()}`;
+        const res = await supabaseReq(query, 'GET');
+
+        if (Array.isArray(res) && res.length > 0) {
+            for (let req of res) {
+                const isApproved = req.status === 'APPROVED';
+                const actionText = req.action === 'ADD' ? 'добавление' : 'снятие';
+                const statusEmoji = isApproved ? '✅ ОДОБРЕНО' : '❌ ОТКЛОНЕНО';
+
+                renderCentralAlertModal({
+                    id: req.id,
+                    title: `Запрос на метку: ${statusEmoji}`,
+                    message: `Руководство рассмотрело запрос на ${actionText} метки "${req.tag_data?.title}" для клиента #${req.client_id}.\nРешение: ${isApproved ? 'Метка успешно синхронизирована!' : 'Запрос отклонен.'}`,
+                    target_scope: 'DEVICE'
+                });
+            }
+        }
+    }
+    setInterval(checkMyTagRequestsStatus, 15000);
 
     initDB();
 })();
